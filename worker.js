@@ -151,14 +151,11 @@ export class Match {
 
   startMatch(){
     this.wordDeck = pickDeck(this.mode, this.level);
-    const starterRole = Math.random() < 0.5 ? "p1" : "p2";
     for(const role of ["p1", "p2"]){
-      const starterLabel = role === starterRole ? "you" : "opponent";
       try{
         this.players[role].send(JSON.stringify({
           type: "start",
           wordDeck: this.wordDeck,
-          starter: starterLabel,
           duration: 100
         }));
       }catch(e){}
