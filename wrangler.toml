@@ -1,4 +1,4 @@
-name = "typing-dojo-online"
+name = "simple-typing-online"
 main = "worker.js"
 compatibility_date = "2024-11-01"
 
