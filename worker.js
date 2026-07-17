@@ -12,7 +12,7 @@ const wordBank = {
 };
 
 function pickDeck(mode, level){
-  const pool = (WORD_BANK[mode] && WORD_BANK[mode][level]) || WORD_BANK.hiragana.beginner;
+  const pool = (wordBank[mode] && wordBank[mode][level]) || wordBank.hiragana.beginner;
   const deck = [];
   for(let i = 0; i < 60; i++){
     deck.push(pool[Math.floor(Math.random() * pool.length)]);
