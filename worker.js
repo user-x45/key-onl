@@ -222,9 +222,85 @@ export class Match {
   }
 }
 
+const RANKING_MAX = 20;
+
+function corsHeaders(){
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Content-Type": "application/json; charset=utf-8"
+  };
+}
+
+export class Ranking {
+  constructor(state, env){
+    this.state = state;
+    this.env = env;
+    this.scores = null;
+  }
+
+  async load(){
+    if(this.scores) return;
+    const stored = await this.state.storage.get("scores");
+    this.scores = Array.isArray(stored) ? stored : [];
+  }
+
+  async fetch(request){
+    if(request.method === "OPTIONS"){
+      return new Response(null, { status: 204, headers: corsHeaders() });
+    }
+
+    await this.load();
+
+    if(request.method === "GET"){
+      return new Response(JSON.stringify(this.scores), { headers: corsHeaders() });
+    }
+
+    if(request.method === "POST"){
+      let body;
+      try{
+        body = await request.json();
+      }catch(e){
+        return new Response(JSON.stringify({ error: "invalid body" }), { status: 400, headers: corsHeaders() });
+      }
+      const score = Math.max(0, Math.round(Number(body.score) || 0));
+
+      let rank = null;
+      const existingIndex = this.scores.indexOf(score);
+      if(existingIndex !== -1){
+        rank = existingIndex < RANKING_MAX ? existingIndex + 1 : null;
+      } else {
+        let pos = 0;
+        while(pos < this.scores.length && this.scores[pos] > score) pos++;
+        if(pos < RANKING_MAX){
+          this.scores.splice(pos, 0, score);
+          if(this.scores.length > RANKING_MAX){
+            this.scores = this.scores.slice(0, RANKING_MAX);
+          }
+          rank = pos + 1;
+          await this.state.storage.put("scores", this.scores);
+        } else {
+          rank = null;
+        }
+      }
+
+      return new Response(JSON.stringify({ rank, top20: this.scores }), { headers: corsHeaders() });
+    }
+
+    return new Response("method not allowed", { status: 405, headers: corsHeaders() });
+  }
+}
+
 export default {
   async fetch(request, env){
     const url = new URL(request.url);
+
+    if(url.pathname === "/ranking"){
+      const id = env.RANKING.idFromName("global");
+      const stub = env.RANKING.get(id);
+      return stub.fetch(request);
+    }
 
     if(url.pathname === "/lobby"){
       const mode = url.searchParams.get("mode") || "hiragana";
