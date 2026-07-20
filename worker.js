@@ -312,18 +312,23 @@ export class Ranking {
 }
 
 const ADMIN_TOKEN_TTL_MS = 30 * 60 * 1000;
+const ADMIN_MAX_ATTEMPTS = 5;
+const ADMIN_ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
+const ADMIN_LOCK_MS = 15 * 60 * 1000;
 
 export class AdminAuth {
   constructor(state, env){
     this.state = state;
     this.env = env;
     this.tokens = null;
+    this.attempts = null;
   }
 
   async load(){
-    if(this.tokens) return;
-    const stored = await this.state.storage.get("tokens");
-    this.tokens = stored || {};
+    if(this.tokens && this.attempts) return;
+    const stored = await this.state.storage.get(["tokens", "attempts"]);
+    this.tokens = stored.get("tokens") || {};
+    this.attempts = stored.get("attempts") || {};
   }
 
   pruneExpired(){
@@ -331,6 +336,16 @@ export class AdminAuth {
     for(const token of Object.keys(this.tokens)){
       if(this.tokens[token] < now){
         delete this.tokens[token];
+      }
+    }
+    for(const ip of Object.keys(this.attempts)){
+      const entry = this.attempts[ip];
+      if(entry.lockUntil && entry.lockUntil < now){
+        delete this.attempts[ip];
+        continue;
+      }
+      if(!entry.lockUntil && entry.firstFailAt < now - ADMIN_ATTEMPT_WINDOW_MS){
+        delete this.attempts[ip];
       }
     }
   }
@@ -348,6 +363,37 @@ export class AdminAuth {
       body = await request.json();
     }catch(e){
       body = {};
+    }
+
+    if(body.action === "checkLock"){
+      const entry = this.attempts[body.ip];
+      const now = Date.now();
+      if(entry && entry.lockUntil && entry.lockUntil > now){
+        return new Response(JSON.stringify({ locked: true, retryAfterSeconds: Math.ceil((entry.lockUntil - now) / 1000) }), { headers: corsHeaders() });
+      }
+      return new Response(JSON.stringify({ locked: false }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "recordFailure"){
+      const now = Date.now();
+      const entry = this.attempts[body.ip] || { count: 0, firstFailAt: now, lockUntil: 0 };
+      if(now - entry.firstFailAt > ADMIN_ATTEMPT_WINDOW_MS){
+        entry.count = 0;
+        entry.firstFailAt = now;
+      }
+      entry.count += 1;
+      if(entry.count >= ADMIN_MAX_ATTEMPTS){
+        entry.lockUntil = now + ADMIN_LOCK_MS;
+      }
+      this.attempts[body.ip] = entry;
+      await this.state.storage.put("attempts", this.attempts);
+      return new Response(JSON.stringify({ locked: Boolean(entry.lockUntil) }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "resetAttempts"){
+      delete this.attempts[body.ip];
+      await this.state.storage.put("attempts", this.attempts);
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
     }
 
     if(body.action === "issue"){
@@ -391,9 +437,32 @@ async function handleAdmin(request, env){
   const authStub = env.ADMIN_AUTH.get(authId);
 
   if(body.action === "login"){
+    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+
+    const lockRes = await authStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "checkLock", ip })
+    }));
+    const lockData = await lockRes.json();
+    if(lockData.locked){
+      return new Response(JSON.stringify({ error: "locked", retryAfterSeconds: lockData.retryAfterSeconds }), { status: 429, headers: corsHeaders() });
+    }
+
     if(body.password !== env.ADMIN_PASSWORD){
+      await authStub.fetch(new Request("https://internal/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "recordFailure", ip })
+      }));
       return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
     }
+
+    await authStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "resetAttempts", ip })
+    }));
     const res = await authStub.fetch(new Request("https://internal/auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
