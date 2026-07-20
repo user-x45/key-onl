@@ -223,6 +223,8 @@ export class Match {
 }
 
 const RANKING_MAX = 20;
+const RANKING_MODES = ["hiragana", "kanji"];
+const RANKING_LEVELS = ["beginner", "intermediate", "advanced"];
 
 function corsHeaders(){
   return {
@@ -264,6 +266,23 @@ export class Ranking {
       }catch(e){
         return new Response(JSON.stringify({ error: "invalid body" }), { status: 400, headers: corsHeaders() });
       }
+
+      if(body.action === "clear"){
+        this.scores = [];
+        await this.state.storage.put("scores", this.scores);
+        return new Response(JSON.stringify({ top20: this.scores }), { headers: corsHeaders() });
+      }
+
+      if(body.action === "delete"){
+        const target = Math.round(Number(body.score));
+        const idx = this.scores.indexOf(target);
+        if(idx !== -1){
+          this.scores.splice(idx, 1);
+          await this.state.storage.put("scores", this.scores);
+        }
+        return new Response(JSON.stringify({ top20: this.scores }), { headers: corsHeaders() });
+      }
+
       const score = Math.max(0, Math.round(Number(body.score) || 0));
 
       let rank = null;
@@ -292,12 +311,82 @@ export class Ranking {
   }
 }
 
+async function handleAdmin(request, env){
+  if(request.method === "OPTIONS"){
+    return new Response(null, { status: 204, headers: corsHeaders() });
+  }
+
+  let body = {};
+  if(request.method === "POST"){
+    try{
+      body = await request.json();
+    }catch(e){
+      body = {};
+    }
+  } else {
+    const url = new URL(request.url);
+    body = {
+      password: url.searchParams.get("password"),
+      action: url.searchParams.get("action") || "list"
+    };
+  }
+
+  if(body.password !== env.ADMIN_PASSWORD){
+    return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+  }
+
+  if(body.action === "list" || !body.action){
+    const result = {};
+    for(const mode of RANKING_MODES){
+      for(const level of RANKING_LEVELS){
+        const id = env.RANKING.idFromName(`${mode}:${level}`);
+        const stub = env.RANKING.get(id);
+        const res = await stub.fetch(new Request("https://internal/ranking", { method: "GET" }));
+        result[`${mode}:${level}`] = await res.json();
+      }
+    }
+    return new Response(JSON.stringify(result), { headers: corsHeaders() });
+  }
+
+  if(body.action === "delete"){
+    const { mode, level, score } = body;
+    const id = env.RANKING.idFromName(`${mode}:${level}`);
+    const stub = env.RANKING.get(id);
+    const res = await stub.fetch(new Request("https://internal/ranking", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "delete", score })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "clear"){
+    const { mode, level } = body;
+    const id = env.RANKING.idFromName(`${mode}:${level}`);
+    const stub = env.RANKING.get(id);
+    const res = await stub.fetch(new Request("https://internal/ranking", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "clear" })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
+}
+
 export default {
   async fetch(request, env){
     const url = new URL(request.url);
 
+    if(url.pathname === "/admin"){
+      return handleAdmin(request, env);
+    }
+
     if(url.pathname === "/ranking"){
-      const id = env.RANKING.idFromName("global");
+      const mode = url.searchParams.get("mode") || "hiragana";
+      const level = url.searchParams.get("level") || "beginner";
+      const id = env.RANKING.idFromName(`${mode}:${level}`);
       const stub = env.RANKING.get(id);
       return stub.fetch(request);
     }
