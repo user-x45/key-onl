@@ -311,6 +311,62 @@ export class Ranking {
   }
 }
 
+const ADMIN_TOKEN_TTL_MS = 30 * 60 * 1000;
+
+export class AdminAuth {
+  constructor(state, env){
+    this.state = state;
+    this.env = env;
+    this.tokens = null;
+  }
+
+  async load(){
+    if(this.tokens) return;
+    const stored = await this.state.storage.get("tokens");
+    this.tokens = stored || {};
+  }
+
+  pruneExpired(){
+    const now = Date.now();
+    for(const token of Object.keys(this.tokens)){
+      if(this.tokens[token] < now){
+        delete this.tokens[token];
+      }
+    }
+  }
+
+  async fetch(request){
+    if(request.method === "OPTIONS"){
+      return new Response(null, { status: 204, headers: corsHeaders() });
+    }
+
+    await this.load();
+    this.pruneExpired();
+
+    let body = {};
+    try{
+      body = await request.json();
+    }catch(e){
+      body = {};
+    }
+
+    if(body.action === "issue"){
+      const token = crypto.randomUUID();
+      this.tokens[token] = Date.now() + ADMIN_TOKEN_TTL_MS;
+      await this.state.storage.put("tokens", this.tokens);
+      return new Response(JSON.stringify({ token }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "verify"){
+      const valid = Boolean(body.token && this.tokens[body.token] && this.tokens[body.token] >= Date.now());
+      await this.state.storage.put("tokens", this.tokens);
+      return new Response(JSON.stringify({ valid }), { headers: corsHeaders() });
+    }
+
+    return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
+  }
+}
+
 async function handleAdmin(request, env){
   if(request.method === "OPTIONS"){
     return new Response(null, { status: 204, headers: corsHeaders() });
@@ -326,12 +382,33 @@ async function handleAdmin(request, env){
   } else {
     const url = new URL(request.url);
     body = {
-      password: url.searchParams.get("password"),
+      token: url.searchParams.get("token"),
       action: url.searchParams.get("action") || "list"
     };
   }
 
-  if(body.password !== env.ADMIN_PASSWORD){
+  const authId = env.ADMIN_AUTH.idFromName("global");
+  const authStub = env.ADMIN_AUTH.get(authId);
+
+  if(body.action === "login"){
+    if(body.password !== env.ADMIN_PASSWORD){
+      return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+    }
+    const res = await authStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "issue" })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  const verifyRes = await authStub.fetch(new Request("https://internal/auth", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "verify", token: body.token })
+  }));
+  const verifyData = await verifyRes.json();
+  if(!verifyData.valid){
     return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
   }
 
