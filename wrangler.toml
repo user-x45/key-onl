@@ -10,6 +10,14 @@ class_name = "Lobby"
 name = "MATCH"
 class_name = "Match"
 
+[[durable_objects.bindings]]
+name = "RANKING"
+class_name = "Ranking"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Lobby", "Match"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Ranking"]
