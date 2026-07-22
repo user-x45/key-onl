@@ -226,6 +226,11 @@ const RANKING_MAX = 20;
 const RANKING_MODES = ["hiragana", "kanji"];
 const RANKING_LEVELS = ["beginner", "intermediate", "advanced"];
 
+function sanitizeRankingName(raw){
+  const trimmed = String(raw || "").trim().slice(0, 6);
+  return trimmed.length === 0 ? "GUEST" : trimmed;
+}
+
 function corsHeaders(){
   return {
     "Access-Control-Allow-Origin": "*",
@@ -245,7 +250,8 @@ export class Ranking {
   async load(){
     if(this.scores) return;
     const stored = await this.state.storage.get("scores");
-    this.scores = Array.isArray(stored) ? stored : [];
+    const list = Array.isArray(stored) ? stored : [];
+    this.scores = list.map(entry => typeof entry === "object" && entry !== null ? entry : { score: entry, name: "GUEST" });
   }
 
   async fetch(request){
@@ -275,7 +281,7 @@ export class Ranking {
 
       if(body.action === "delete"){
         const target = Math.round(Number(body.score));
-        const idx = this.scores.indexOf(target);
+        const idx = this.scores.findIndex(s => (typeof s === "object" && s !== null ? s.score : s) === target);
         if(idx !== -1){
           this.scores.splice(idx, 1);
           await this.state.storage.put("scores", this.scores);
@@ -284,16 +290,17 @@ export class Ranking {
       }
 
       const score = Math.max(0, Math.round(Number(body.score) || 0));
+      const name = sanitizeRankingName(body.name);
 
       let rank = null;
-      const existingIndex = this.scores.indexOf(score);
+      const existingIndex = this.scores.findIndex(s => s.score === score && s.name === name);
       if(existingIndex !== -1){
         rank = existingIndex < RANKING_MAX ? existingIndex + 1 : null;
       } else {
         let pos = 0;
-        while(pos < this.scores.length && this.scores[pos] > score) pos++;
+        while(pos < this.scores.length && this.scores[pos].score > score) pos++;
         if(pos < RANKING_MAX){
-          this.scores.splice(pos, 0, score);
+          this.scores.splice(pos, 0, { score, name });
           if(this.scores.length > RANKING_MAX){
             this.scores = this.scores.slice(0, RANKING_MAX);
           }
