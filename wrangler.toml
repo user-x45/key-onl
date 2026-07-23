@@ -18,6 +18,10 @@ class_name = "Ranking"
 name = "ADMIN_AUTH"
 class_name = "AdminAuth"
 
+[[durable_objects.bindings]]
+name = "USER_AUTH"
+class_name = "UserAuth"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Lobby", "Match"]
@@ -29,3 +33,10 @@ new_sqlite_classes = ["Ranking"]
 [[migrations]]
 tag = "v3"
 new_sqlite_classes = ["AdminAuth"]
+
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["UserAuth"]
+
+[vars]
+GOOGLE_CLIENT_ID = "934662707347-mog2fs8vq4ifl4hq4s5dobkv1oauni6n.apps.googleusercontent.com"
