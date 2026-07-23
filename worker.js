@@ -318,6 +318,173 @@ export class Ranking {
   }
 }
 
+const SESSION_TOKEN_TTL_MS = 400 * 24 * 60 * 60 * 1000;
+const PENDING_TOKEN_TTL_MS = 10 * 60 * 1000;
+
+export class UserAuth {
+  constructor(state, env){
+    this.state = state;
+    this.env = env;
+    this.users = null;
+    this.sessions = null;
+    this.pending = null;
+  }
+
+  async load(){
+    if(this.users && this.sessions && this.pending) return;
+    const stored = await this.state.storage.get(["users", "sessions", "pending"]);
+    this.users = stored.get("users") || {};
+    this.sessions = stored.get("sessions") || {};
+    this.pending = stored.get("pending") || {};
+  }
+
+  pruneExpired(){
+    const now = Date.now();
+    for(const token of Object.keys(this.sessions)){
+      if(this.sessions[token].expires < now) delete this.sessions[token];
+    }
+    for(const token of Object.keys(this.pending)){
+      if(this.pending[token].expires < now) delete this.pending[token];
+    }
+  }
+
+  async fetch(request){
+    if(request.method === "OPTIONS"){
+      return new Response(null, { status: 204, headers: corsHeaders() });
+    }
+
+    await this.load();
+    this.pruneExpired();
+
+    let body = {};
+    try{
+      body = await request.json();
+    }catch(e){
+      body = {};
+    }
+
+    if(body.action === "resolveLogin"){
+      const { sub } = body;
+      const existing = this.users[sub];
+      if(existing){
+        const token = crypto.randomUUID();
+        this.sessions[token] = { sub, expires: Date.now() + SESSION_TOKEN_TTL_MS };
+        await this.state.storage.put("sessions", this.sessions);
+        return new Response(JSON.stringify({ isNewUser: false, token, name: existing.name }), { headers: corsHeaders() });
+      }
+      const pendingToken = crypto.randomUUID();
+      this.pending[pendingToken] = { sub, expires: Date.now() + PENDING_TOKEN_TTL_MS };
+      await this.state.storage.put("pending", this.pending);
+      return new Response(JSON.stringify({ isNewUser: true, pendingToken }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "register"){
+      const { pendingToken, name } = body;
+      const entry = this.pending[pendingToken];
+      if(!entry || entry.expires < Date.now()){
+        return new Response(JSON.stringify({ error: "invalid pending token" }), { status: 400, headers: corsHeaders() });
+      }
+      const cleanName = (name || "").trim().slice(0, 6) || "GUEST";
+      this.users[entry.sub] = { name: cleanName };
+      delete this.pending[pendingToken];
+      const token = crypto.randomUUID();
+      this.sessions[token] = { sub: entry.sub, expires: Date.now() + SESSION_TOKEN_TTL_MS };
+      await this.state.storage.put("users", this.users);
+      await this.state.storage.put("pending", this.pending);
+      await this.state.storage.put("sessions", this.sessions);
+      return new Response(JSON.stringify({ token, name: cleanName }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "verify"){
+      const entry = this.sessions[body.token];
+      if(!entry || entry.expires < Date.now()){
+        return new Response(JSON.stringify({ valid: false }), { headers: corsHeaders() });
+      }
+      const user = this.users[entry.sub];
+      if(!user){
+        return new Response(JSON.stringify({ valid: false }), { headers: corsHeaders() });
+      }
+      return new Response(JSON.stringify({ valid: true, name: user.name }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "logout"){
+      delete this.sessions[body.token];
+      await this.state.storage.put("sessions", this.sessions);
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
+    }
+
+    return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
+  }
+}
+
+async function verifyGoogleIdToken(idToken, expectedAudience){
+  const res = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`);
+  if(!res.ok) return null;
+  const payload = await res.json();
+  if(!payload.sub) return null;
+  if(payload.aud !== expectedAudience) return null;
+  if(payload.iss !== "accounts.google.com" && payload.iss !== "https://accounts.google.com") return null;
+  return payload;
+}
+
+async function handleAuth(request, env){
+  if(request.method === "OPTIONS"){
+    return new Response(null, { status: 204, headers: corsHeaders() });
+  }
+
+  let body = {};
+  try{
+    body = await request.json();
+  }catch(e){
+    body = {};
+  }
+
+  const authId = env.USER_AUTH.idFromName("global");
+  const authStub = env.USER_AUTH.get(authId);
+
+  if(body.action === "login"){
+    const payload = await verifyGoogleIdToken(body.idToken, env.GOOGLE_CLIENT_ID);
+    if(!payload){
+      return new Response(JSON.stringify({ error: "invalid id token" }), { status: 401, headers: corsHeaders() });
+    }
+    const res = await authStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "resolveLogin", sub: payload.sub })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "register"){
+    const res = await authStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "register", pendingToken: body.pendingToken, name: body.name })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "verify"){
+    const res = await authStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "verify", token: body.token })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "logout"){
+    const res = await authStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "logout", token: body.token })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
+}
+
 const ADMIN_TOKEN_TTL_MS = 30 * 60 * 1000;
 const ADMIN_MAX_ATTEMPTS = 5;
 const ADMIN_ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
@@ -534,6 +701,10 @@ export default {
 
     if(url.pathname === "/admin"){
       return handleAdmin(request, env);
+    }
+
+    if(url.pathname === "/auth"){
+      return handleAuth(request, env);
     }
 
     if(url.pathname === "/ranking"){
