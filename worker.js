@@ -385,7 +385,7 @@ export class UserAuth {
         return new Response(JSON.stringify({ error: "invalid pending token" }), { status: 400, headers: corsHeaders() });
       }
       const cleanName = (name || "").trim().slice(0, 6) || "GUEST";
-      this.users[entry.sub] = { name: cleanName };
+      this.users[entry.sub] = { name: cleanName, highScores: {} };
       delete this.pending[pendingToken];
       const token = crypto.randomUUID();
       this.sessions[token] = { sub: entry.sub, expires: Date.now() + SESSION_TOKEN_TTL_MS };
@@ -405,6 +405,38 @@ export class UserAuth {
         return new Response(JSON.stringify({ valid: false }), { headers: corsHeaders() });
       }
       return new Response(JSON.stringify({ valid: true, name: user.name }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "getHighScores"){
+      const entry = this.sessions[body.token];
+      if(!entry || entry.expires < Date.now()){
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+      }
+      const user = this.users[entry.sub];
+      if(!user){
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+      }
+      return new Response(JSON.stringify({ highScores: user.highScores || {} }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "setHighScore"){
+      const entry = this.sessions[body.token];
+      if(!entry || entry.expires < Date.now()){
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+      }
+      const user = this.users[entry.sub];
+      if(!user){
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+      }
+      const { mode, level, score } = body;
+      const key = `highScore_${mode}_${level}`;
+      if(!user.highScores) user.highScores = {};
+      const current = user.highScores[key] || 0;
+      if(score > current){
+        user.highScores[key] = score;
+        await this.state.storage.put("users", this.users);
+      }
+      return new Response(JSON.stringify({ ok: true, highScore: user.highScores[key] || current }), { headers: corsHeaders() });
     }
 
     if(body.action === "logout"){
@@ -469,6 +501,24 @@ async function handleAuth(request, env){
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "verify", token: body.token })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "getHighScores"){
+    const res = await authStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "getHighScores", token: body.token })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "setHighScore"){
+    const res = await authStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "setHighScore", token: body.token, mode: body.mode, level: body.level, score: body.score })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
