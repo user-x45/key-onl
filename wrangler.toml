@@ -39,4 +39,4 @@ tag = "v4"
 new_sqlite_classes = ["UserAuth"]
 
 [vars]
-GOOGLE_CLIENT_ID = "934662707347-mog2fs8vq4ifl4hq4s5dobkv1oauni6n.apps.googleusercontent.com"
+GOOGLE_CLIENT_ID = "7365893755-eqm3coij6otohorig4bgq4mtoen1q7sf.apps.googleusercontent.com"
