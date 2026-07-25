@@ -439,6 +439,21 @@ export class UserAuth {
       return new Response(JSON.stringify({ ok: true, highScore: user.highScores[key] || current }), { headers: corsHeaders() });
     }
 
+    if(body.action === "setName"){
+      const entry = this.sessions[body.token];
+      if(!entry || entry.expires < Date.now()){
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+      }
+      const user = this.users[entry.sub];
+      if(!user){
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+      }
+      const cleanName = (body.name || "").trim().slice(0, 6) || "GUEST";
+      user.name = cleanName;
+      await this.state.storage.put("users", this.users);
+      return new Response(JSON.stringify({ ok: true, name: cleanName }), { headers: corsHeaders() });
+    }
+
     if(body.action === "logout"){
       delete this.sessions[body.token];
       await this.state.storage.put("sessions", this.sessions);
@@ -519,6 +534,15 @@ async function handleAuth(request, env){
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "setHighScore", token: body.token, mode: body.mode, level: body.level, score: body.score })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "setName"){
+    const res = await authStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "setName", token: body.token, name: body.name })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
