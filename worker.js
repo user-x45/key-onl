@@ -223,7 +223,7 @@ export class Match {
 }
 
 const RANKING_MAX = 20;
-const RANKING_MODES = ["hiragana", "kanji"];
+const RANKING_MODES = ["hiragana", "sentence"];
 const RANKING_LEVELS = ["beginner", "intermediate", "advanced"];
 
 function sanitizeRankingName(raw){
