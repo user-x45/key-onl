@@ -745,6 +745,59 @@ async function handleAdmin(request, env){
   return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
 }
 
+const SITE_URL = "https://s-typing.f5.si";
+
+function getCookie(request, name){
+  const cookieHeader = request.headers.get("Cookie") || "";
+  const parts = cookieHeader.split(";").map(p => p.trim());
+  for(const part of parts){
+    const eq = part.indexOf("=");
+    if(eq === -1) continue;
+    if(part.slice(0, eq) === name) return part.slice(eq + 1);
+  }
+  return null;
+}
+
+async function handleGoogleRedirect(request, env){
+  if(request.method !== "POST"){
+    return Response.redirect(SITE_URL, 302);
+  }
+
+  let form;
+  try{
+    form = await request.formData();
+  }catch(e){
+    return Response.redirect(`${SITE_URL}/?loginError=1`, 302);
+  }
+
+  const credential = form.get("credential");
+  const csrfBody = form.get("g_csrf_token");
+  const csrfCookie = getCookie(request, "g_csrf_token");
+
+  if(!credential || !csrfBody || !csrfCookie || csrfBody !== csrfCookie){
+    return Response.redirect(`${SITE_URL}/?loginError=1`, 302);
+  }
+
+  const payload = await verifyGoogleIdToken(credential, env.GOOGLE_CLIENT_ID);
+  if(!payload){
+    return Response.redirect(`${SITE_URL}/?loginError=1`, 302);
+  }
+
+  const authId = env.USER_AUTH.idFromName("global");
+  const authStub = env.USER_AUTH.get(authId);
+  const res = await authStub.fetch(new Request("https://internal/auth", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "resolveLogin", sub: payload.sub })
+  }));
+  const data = await res.json();
+
+  if(data.isNewUser){
+    return Response.redirect(`${SITE_URL}/?pendingToken=${encodeURIComponent(data.pendingToken)}&newUser=1`, 302);
+  }
+  return Response.redirect(`${SITE_URL}/?token=${encodeURIComponent(data.token)}&name=${encodeURIComponent(data.name)}`, 302);
+}
+
 export default {
   async fetch(request, env){
     const url = new URL(request.url);
@@ -755,6 +808,10 @@ export default {
 
     if(url.pathname === "/auth"){
       return handleAuth(request, env);
+    }
+
+    if(url.pathname === "/google-redirect"){
+      return handleGoogleRedirect(request, env);
     }
 
     if(url.pathname === "/ranking"){
