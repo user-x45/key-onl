@@ -460,6 +460,29 @@ export class UserAuth {
       return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
     }
 
+    if(body.action === "listUsers"){
+      const list = Object.keys(this.users).map(sub => ({
+        sub,
+        name: this.users[sub].name,
+        highScores: this.users[sub].highScores || {}
+      }));
+      return new Response(JSON.stringify({ users: list }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "deleteUser"){
+      const { sub } = body;
+      if(!this.users[sub]){
+        return new Response(JSON.stringify({ error: "not found" }), { status: 404, headers: corsHeaders() });
+      }
+      delete this.users[sub];
+      for(const token of Object.keys(this.sessions)){
+        if(this.sessions[token].sub === sub) delete this.sessions[token];
+      }
+      await this.state.storage.put("users", this.users);
+      await this.state.storage.put("sessions", this.sessions);
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
+    }
+
     return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
   }
 }
@@ -762,6 +785,29 @@ async function handleAdmin(request, env){
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "clear" })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "listUsers"){
+    const userAuthId = env.USER_AUTH.idFromName("global");
+    const userAuthStub = env.USER_AUTH.get(userAuthId);
+    const res = await userAuthStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "listUsers" })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "deleteUser"){
+    const { sub } = body;
+    const userAuthId = env.USER_AUTH.idFromName("global");
+    const userAuthStub = env.USER_AUTH.get(userAuthId);
+    const res = await userAuthStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "deleteUser", sub })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
