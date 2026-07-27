@@ -34,29 +34,30 @@ export class Lobby {
     const url = new URL(request.url);
     const mode = url.searchParams.get("mode") || "hiragana";
     const level = url.searchParams.get("level") || "beginner";
+    const name = String(url.searchParams.get("name") || "GUEST").trim().slice(0, 6) || "GUEST";
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
-    this.handleSocket(server, mode, level);
+    this.handleSocket(server, mode, level, name);
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  handleSocket(ws, mode, level){
+  handleSocket(ws, mode, level, name){
     if(this.waiting){
       const partner = this.waiting;
       this.waiting = null;
       clearTimeout(partner.timeoutId);
       const matchId = crypto.randomUUID();
       try{
-        partner.ws.send(JSON.stringify({ type: "matched", matchId, role: "p1" }));
+        partner.ws.send(JSON.stringify({ type: "matched", matchId, role: "p1", opponentName: name }));
         partner.ws.close(1000, "matched");
       }catch(e){}
-      ws.send(JSON.stringify({ type: "matched", matchId, role: "p2" }));
+      ws.send(JSON.stringify({ type: "matched", matchId, role: "p2", opponentName: partner.name }));
       ws.close(1000, "matched");
       return;
     }
 
-    const entry = { ws, mode, level, timeoutId: null };
+    const entry = { ws, mode, level, name, timeoutId: null };
     entry.timeoutId = setTimeout(() => {
       if(this.waiting === entry){
         this.waiting = null;
