@@ -517,12 +517,12 @@ async function handleGoogleRedirect(request, env){
   }
 
   if(!credential){
-    return Response.redirect(`${returnTo}?glogin=error`, 303);
+    return Response.redirect(`${returnTo}?glogin=error`, 302);
   }
 
   const payload = await verifyGoogleIdToken(credential, env.GOOGLE_CLIENT_ID);
   if(!payload){
-    return Response.redirect(`${returnTo}?glogin=error`, 303);
+    return Response.redirect(`${returnTo}?glogin=error`, 302);
   }
 
   const authId = env.USER_AUTH.idFromName("global");
@@ -535,12 +535,12 @@ async function handleGoogleRedirect(request, env){
   const data = await res.json();
 
   if(data.isNewUser){
-    return Response.redirect(`${returnTo}?glogin=new&pendingToken=${encodeURIComponent(data.pendingToken)}`, 303);
+    return Response.redirect(`${returnTo}?glogin=new&pendingToken=${encodeURIComponent(data.pendingToken)}`, 302);
   }
   if(data.token){
-    return Response.redirect(`${returnTo}?glogin=ok&token=${encodeURIComponent(data.token)}&name=${encodeURIComponent(data.name || "")}`, 303);
+    return Response.redirect(`${returnTo}?glogin=ok&token=${encodeURIComponent(data.token)}&name=${encodeURIComponent(data.name || "")}`, 302);
   }
-  return Response.redirect(`${returnTo}?glogin=error`, 303);
+  return Response.redirect(`${returnTo}?glogin=error`, 302);
 }
 
 async function handleAuth(request, env){
