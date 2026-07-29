@@ -503,6 +503,45 @@ async function verifyGoogleIdToken(idToken, expectedAudience){
   return payload;
 }
 
+async function handleGoogleRedirect(request, env){
+  const url = new URL(request.url);
+  const returnTo = url.searchParams.get("return") || "/";
+
+  let credential = null;
+  try{
+    const form = await request.formData();
+    credential = form.get("credential");
+  }catch(e){
+    credential = null;
+  }
+
+  if(!credential){
+    return Response.redirect(`${returnTo}?glogin=error`, 302);
+  }
+
+  const payload = await verifyGoogleIdToken(credential, env.GOOGLE_CLIENT_ID);
+  if(!payload){
+    return Response.redirect(`${returnTo}?glogin=error`, 302);
+  }
+
+  const authId = env.USER_AUTH.idFromName("global");
+  const authStub = env.USER_AUTH.get(authId);
+  const res = await authStub.fetch(new Request("https://internal/auth", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "resolveLogin", sub: payload.sub })
+  }));
+  const data = await res.json();
+
+  if(data.isNewUser){
+    return Response.redirect(`${returnTo}?glogin=new&pendingToken=${encodeURIComponent(data.pendingToken)}`, 302);
+  }
+  if(data.token){
+    return Response.redirect(`${returnTo}?glogin=ok&token=${encodeURIComponent(data.token)}&name=${encodeURIComponent(data.name || "")}`, 302);
+  }
+  return Response.redirect(`${returnTo}?glogin=error`, 302);
+}
+
 async function handleAuth(request, env){
   if(request.method === "OPTIONS"){
     return new Response(null, { status: 204, headers: corsHeaders() });
@@ -831,6 +870,10 @@ export default {
 
     if(url.pathname === "/auth"){
       return handleAuth(request, env);
+    }
+
+    if(url.pathname === "/auth/google-redirect"){
+      return handleGoogleRedirect(request, env);
     }
 
     if(url.pathname === "/ranking"){
