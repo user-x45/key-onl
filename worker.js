@@ -503,9 +503,10 @@ async function verifyGoogleIdToken(idToken, expectedAudience){
   return payload;
 }
 
+const SITE_ORIGIN = "https://s-typing.f5.si";
+
 async function handleGoogleRedirect(request, env){
-  const url = new URL(request.url);
-  const returnTo = url.searchParams.get("return") || "/";
+  const returnTo = SITE_ORIGIN;
 
   let credential = null;
   try{
