@@ -83,12 +83,27 @@ export class Lobby {
   }
 }
 
+const FRIEND_ROOM_TTL_MS = 600000;
+
 export class FriendRoom {
   constructor(state, env){
     this.state = state;
     this.env = env;
     this.host = null;
     this.guest = null;
+    this.expiresAt = null;
+    this.closed = false;
+    this.state.blockConcurrencyWhile(async () => {
+      const stored = await this.state.storage.get("room");
+      if(stored){
+        this.expiresAt = stored.expiresAt;
+        this.closed = stored.closed;
+      }
+    });
+  }
+
+  async persist(){
+    await this.state.storage.put("room", { expiresAt: this.expiresAt, closed: this.closed });
   }
 
   async fetch(request){
@@ -100,6 +115,16 @@ export class FriendRoom {
     if(role !== "host" && role !== "guest"){
       return new Response("bad request", { status: 400 });
     }
+
+    if(this.expiresAt === null){
+      this.expiresAt = Date.now() + FRIEND_ROOM_TTL_MS;
+      await this.persist();
+      await this.state.storage.setAlarm(this.expiresAt);
+    }
+    if(this.closed || Date.now() >= this.expiresAt){
+      return new Response("expired", { status: 410 });
+    }
+
     const mode = url.searchParams.get("mode") || "hiragana";
     const level = url.searchParams.get("level") || "beginner";
     const name = String(url.searchParams.get("name") || "GUEST").trim().slice(0, 6) || "GUEST";
@@ -117,21 +142,11 @@ export class FriendRoom {
       }catch(e){}
     }
 
-    const entry = { ws, mode, level, name, timeoutId: null };
-    entry.timeoutId = setTimeout(() => {
-      if(this[role] === entry){
-        this[role] = null;
-        try{
-          ws.send(JSON.stringify({ type: "timeout" }));
-          ws.close(1000, "timeout");
-        }catch(e){}
-      }
-    }, 300000);
+    const entry = { ws, mode, level, name };
     this[role] = entry;
 
     ws.addEventListener("close", () => {
       if(this[role] === entry){
-        clearTimeout(entry.timeoutId);
         this[role] = null;
       }
     });
@@ -139,14 +154,14 @@ export class FriendRoom {
     this.tryMatch();
   }
 
-  tryMatch(){
+  async tryMatch(){
     if(!this.host || !this.guest) return;
     const host = this.host;
     const guest = this.guest;
     this.host = null;
     this.guest = null;
-    clearTimeout(host.timeoutId);
-    clearTimeout(guest.timeoutId);
+    this.closed = true;
+    await this.persist();
     const matchId = crypto.randomUUID();
     try{
       host.ws.send(JSON.stringify({ type: "matched", matchId, role: "p1", opponentName: guest.name, mode: host.mode, level: host.level }));
@@ -156,6 +171,25 @@ export class FriendRoom {
       guest.ws.send(JSON.stringify({ type: "matched", matchId, role: "p2", opponentName: host.name, mode: host.mode, level: host.level }));
       guest.ws.close(1000, "matched");
     }catch(e){}
+  }
+
+  async alarm(){
+    this.closed = true;
+    await this.persist();
+    if(this.host){
+      try{
+        this.host.ws.send(JSON.stringify({ type: "timeout" }));
+        this.host.ws.close(1000, "timeout");
+      }catch(e){}
+      this.host = null;
+    }
+    if(this.guest){
+      try{
+        this.guest.ws.send(JSON.stringify({ type: "timeout" }));
+        this.guest.ws.close(1000, "timeout");
+      }catch(e){}
+      this.guest = null;
+    }
   }
 }
 
