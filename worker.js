@@ -175,7 +175,6 @@ export class FriendRoom {
 
   async alarm(){
     this.closed = true;
-    await this.persist();
     if(this.host){
       try{
         this.host.ws.send(JSON.stringify({ type: "timeout" }));
@@ -190,6 +189,7 @@ export class FriendRoom {
       }catch(e){}
       this.guest = null;
     }
+    await this.state.storage.deleteAll();
   }
 }
 
