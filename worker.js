@@ -83,6 +83,82 @@ export class Lobby {
   }
 }
 
+export class FriendRoom {
+  constructor(state, env){
+    this.state = state;
+    this.env = env;
+    this.host = null;
+    this.guest = null;
+  }
+
+  async fetch(request){
+    if(request.headers.get("Upgrade") !== "websocket"){
+      return new Response("expected websocket", { status: 426 });
+    }
+    const url = new URL(request.url);
+    const role = url.searchParams.get("role");
+    if(role !== "host" && role !== "guest"){
+      return new Response("bad request", { status: 400 });
+    }
+    const mode = url.searchParams.get("mode") || "hiragana";
+    const level = url.searchParams.get("level") || "beginner";
+    const name = String(url.searchParams.get("name") || "GUEST").trim().slice(0, 6) || "GUEST";
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    server.accept();
+    this.handleSocket(server, role, mode, level, name);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  handleSocket(ws, role, mode, level, name){
+    if(this[role]){
+      try{
+        this[role].ws.close(1000, "replaced");
+      }catch(e){}
+    }
+
+    const entry = { ws, mode, level, name, timeoutId: null };
+    entry.timeoutId = setTimeout(() => {
+      if(this[role] === entry){
+        this[role] = null;
+        try{
+          ws.send(JSON.stringify({ type: "timeout" }));
+          ws.close(1000, "timeout");
+        }catch(e){}
+      }
+    }, 300000);
+    this[role] = entry;
+
+    ws.addEventListener("close", () => {
+      if(this[role] === entry){
+        clearTimeout(entry.timeoutId);
+        this[role] = null;
+      }
+    });
+
+    this.tryMatch();
+  }
+
+  tryMatch(){
+    if(!this.host || !this.guest) return;
+    const host = this.host;
+    const guest = this.guest;
+    this.host = null;
+    this.guest = null;
+    clearTimeout(host.timeoutId);
+    clearTimeout(guest.timeoutId);
+    const matchId = crypto.randomUUID();
+    try{
+      host.ws.send(JSON.stringify({ type: "matched", matchId, role: "p1", opponentName: guest.name, mode: host.mode, level: host.level }));
+      host.ws.close(1000, "matched");
+    }catch(e){}
+    try{
+      guest.ws.send(JSON.stringify({ type: "matched", matchId, role: "p2", opponentName: host.name, mode: host.mode, level: host.level }));
+      guest.ws.close(1000, "matched");
+    }catch(e){}
+  }
+}
+
 export class Match {
   constructor(state, env){
     this.state = state;
@@ -846,6 +922,16 @@ export default {
       const level = url.searchParams.get("level") || "beginner";
       const id = env.LOBBY.idFromName(`${mode}:${level}`);
       const stub = env.LOBBY.get(id);
+      return stub.fetch(request);
+    }
+
+    if(url.pathname.startsWith("/friend/")){
+      const code = url.pathname.split("/")[2];
+      if(!code){
+        return new Response("missing room code", { status: 400 });
+      }
+      const id = env.FRIEND_ROOM.idFromName(code);
+      const stub = env.FRIEND_ROOM.get(id);
       return stub.fetch(request);
     }
 
