@@ -117,6 +117,9 @@ export class FriendRoom {
     }
 
     if(this.expiresAt === null){
+      if(role === "guest"){
+        return new Response("room not found", { status: 404 });
+      }
       this.expiresAt = Date.now() + FRIEND_ROOM_TTL_MS;
       await this.persist();
       await this.state.storage.setAlarm(this.expiresAt);
