@@ -93,43 +93,104 @@ export class FriendRoom {
     this.guest = null;
     this.expiresAt = null;
     this.closed = false;
+    this.code = null;
     this.state.blockConcurrencyWhile(async () => {
       const stored = await this.state.storage.get("room");
       if(stored){
         this.expiresAt = stored.expiresAt;
         this.closed = stored.closed;
+        this.code = stored.code || null;
       }
     });
   }
 
   async persist(){
-    await this.state.storage.put("room", { expiresAt: this.expiresAt, closed: this.closed });
+    await this.state.storage.put("room", { expiresAt: this.expiresAt, closed: this.closed, code: this.code });
+  }
+
+  async registerCode(mode, level){
+    if(!this.code || !this.env.FRIEND_REGISTRY) return;
+    const regId = this.env.FRIEND_REGISTRY.idFromName("global");
+    const regStub = this.env.FRIEND_REGISTRY.get(regId);
+    try{
+      await regStub.fetch(new Request("https://internal/registry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "register", code: this.code, expiresAt: this.expiresAt, mode, level })
+      }));
+    }catch(e){}
+  }
+
+  async unregisterCode(){
+    if(!this.code || !this.env.FRIEND_REGISTRY) return;
+    const regId = this.env.FRIEND_REGISTRY.idFromName("global");
+    const regStub = this.env.FRIEND_REGISTRY.get(regId);
+    try{
+      await regStub.fetch(new Request("https://internal/registry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "unregister", code: this.code })
+      }));
+    }catch(e){}
+  }
+
+  async forceClose(){
+    this.closed = true;
+    await this.persist();
+    if(this.host){
+      try{ this.host.ws.close(1000, "closed"); }catch(e){}
+      this.host = null;
+    }
+    if(this.guest){
+      try{ this.guest.ws.close(1000, "closed"); }catch(e){}
+      this.guest = null;
+    }
+    await this.unregisterCode();
   }
 
   async fetch(request){
+    const url = new URL(request.url);
+
+    if(request.method === "POST"){
+      let body = {};
+      try{
+        body = await request.json();
+      }catch(e){
+        body = {};
+      }
+      if(body.action === "close"){
+        await this.forceClose();
+        return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
+      }
+      return new Response("bad request", { status: 400 });
+    }
+
     if(request.headers.get("Upgrade") !== "websocket"){
       return new Response("expected websocket", { status: 426 });
     }
-    const url = new URL(request.url);
     const role = url.searchParams.get("role");
     if(role !== "host" && role !== "guest"){
       return new Response("bad request", { status: 400 });
     }
 
+    const code = url.pathname.split("/")[2];
+    const mode = url.searchParams.get("mode") || "hiragana";
+    const level = url.searchParams.get("level") || "beginner";
+
     if(this.expiresAt === null){
       if(role === "guest"){
         return new Response("room not found", { status: 404 });
       }
+      this.code = code;
       this.expiresAt = Date.now() + FRIEND_ROOM_TTL_MS;
       await this.persist();
       await this.state.storage.setAlarm(this.expiresAt);
+      await this.registerCode(mode, level);
     }
     if(this.closed || Date.now() >= this.expiresAt){
       return new Response("expired", { status: 410 });
     }
 
-    const mode = url.searchParams.get("mode") || "hiragana";
-    const level = url.searchParams.get("level") || "beginner";
     const name = String(url.searchParams.get("name") || "GUEST").trim().slice(0, 6) || "GUEST";
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -165,6 +226,7 @@ export class FriendRoom {
     this.guest = null;
     this.closed = true;
     await this.persist();
+    await this.unregisterCode();
     const matchId = crypto.randomUUID();
     try{
       host.ws.send(JSON.stringify({ type: "matched", matchId, role: "p1", opponentName: guest.name, mode: host.mode, level: host.level }));
@@ -192,7 +254,69 @@ export class FriendRoom {
       }catch(e){}
       this.guest = null;
     }
+    await this.unregisterCode();
     await this.state.storage.deleteAll();
+  }
+}
+
+export class FriendRegistry {
+  constructor(state, env){
+    this.state = state;
+    this.env = env;
+    this.codes = null;
+  }
+
+  async load(){
+    if(this.codes) return;
+    this.codes = (await this.state.storage.get("codes")) || {};
+  }
+
+  pruneExpired(){
+    const now = Date.now();
+    for(const code of Object.keys(this.codes)){
+      if(this.codes[code].expiresAt < now){
+        delete this.codes[code];
+      }
+    }
+  }
+
+  async fetch(request){
+    await this.load();
+    this.pruneExpired();
+
+    let body = {};
+    try{
+      body = await request.json();
+    }catch(e){
+      body = {};
+    }
+
+    if(body.action === "register"){
+      const existing = this.codes[body.code];
+      this.codes[body.code] = {
+        createdAt: existing ? existing.createdAt : Date.now(),
+        expiresAt: body.expiresAt,
+        mode: body.mode,
+        level: body.level
+      };
+      await this.state.storage.put("codes", this.codes);
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "unregister"){
+      delete this.codes[body.code];
+      await this.state.storage.put("codes", this.codes);
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "list"){
+      await this.state.storage.put("codes", this.codes);
+      const list = Object.keys(this.codes).map(code => ({ code, ...this.codes[code] }));
+      list.sort((a, b) => b.createdAt - a.createdAt);
+      return new Response(JSON.stringify({ codes: list }), { headers: corsHeaders() });
+    }
+
+    return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
   }
 }
 
@@ -929,6 +1053,38 @@ async function handleAdmin(request, env){
       body: JSON.stringify({ action: "deleteUser", sub })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "listInviteCodes"){
+    const regId = env.FRIEND_REGISTRY.idFromName("global");
+    const regStub = env.FRIEND_REGISTRY.get(regId);
+    const res = await regStub.fetch(new Request("https://internal/registry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "list" })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "deleteInviteCode"){
+    const { code } = body;
+    const roomId = env.FRIEND_ROOM.idFromName(code);
+    const roomStub = env.FRIEND_ROOM.get(roomId);
+    try{
+      await roomStub.fetch(new Request("https://internal/friend-room", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "close" })
+      }));
+    }catch(e){}
+    const regId = env.FRIEND_REGISTRY.idFromName("global");
+    const regStub = env.FRIEND_REGISTRY.get(regId);
+    await regStub.fetch(new Request("https://internal/registry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "unregister", code })
+    }));
+    return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
   }
 
   return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
