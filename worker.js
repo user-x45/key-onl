@@ -1123,6 +1123,9 @@ export default {
       if(!code){
         return new Response("missing room code", { status: 400 });
       }
+      if(!/^[0-9]+$/.test(code)){
+        return new Response("invalid room code", { status: 400 });
+      }
       const id = env.FRIEND_ROOM.idFromName(code);
       const stub = env.FRIEND_ROOM.get(id);
       return stub.fetch(request);
