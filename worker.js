@@ -827,6 +827,81 @@ async function handleAuth(request, env){
   return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
 }
 
+const PLAY_LOG_MAX = 500;
+
+export class PlayLog {
+  constructor(state, env){
+    this.state = state;
+    this.env = env;
+    this.entries = null;
+  }
+
+  async load(){
+    if(this.entries) return;
+    const stored = await this.state.storage.get("entries");
+    this.entries = Array.isArray(stored) ? stored : [];
+  }
+
+  async fetch(request){
+    if(request.method === "OPTIONS"){
+      return new Response(null, { status: 204, headers: corsHeaders() });
+    }
+
+    await this.load();
+
+    let body = {};
+    try{
+      body = await request.json();
+    }catch(e){
+      body = {};
+    }
+
+    if(body.action === "record"){
+      const name = sanitizeRankingName(body.name);
+      const mode = String(body.mode || "");
+      const level = String(body.level || "");
+      this.entries.unshift({ name, mode, level, ts: Date.now() });
+      if(this.entries.length > PLAY_LOG_MAX){
+        this.entries = this.entries.slice(0, PLAY_LOG_MAX);
+      }
+      await this.state.storage.put("entries", this.entries);
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "list"){
+      return new Response(JSON.stringify({ entries: this.entries }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "clear"){
+      this.entries = [];
+      await this.state.storage.put("entries", this.entries);
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
+    }
+
+    return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
+  }
+}
+
+async function handlePlayLog(request, env){
+  if(request.method === "OPTIONS"){
+    return new Response(null, { status: 204, headers: corsHeaders() });
+  }
+  let body = {};
+  try{
+    body = await request.json();
+  }catch(e){
+    body = {};
+  }
+  const id = env.PLAY_LOG.idFromName("global");
+  const stub = env.PLAY_LOG.get(id);
+  const res = await stub.fetch(new Request("https://internal/playlog", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "record", name: body.name, mode: body.mode, level: body.level })
+  }));
+  return new Response(await res.text(), { headers: corsHeaders() });
+}
+
 const ADMIN_TOKEN_TTL_MS = 30 * 60 * 1000;
 const ADMIN_MAX_ATTEMPTS = 5;
 const ADMIN_ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
@@ -1057,6 +1132,28 @@ async function handleAdmin(request, env){
     return new Response(await res.text(), { headers: corsHeaders() });
   }
 
+  if(body.action === "listPlayLog"){
+    const id = env.PLAY_LOG.idFromName("global");
+    const stub = env.PLAY_LOG.get(id);
+    const res = await stub.fetch(new Request("https://internal/playlog", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "list" })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "clearPlayLog"){
+    const id = env.PLAY_LOG.idFromName("global");
+    const stub = env.PLAY_LOG.get(id);
+    const res = await stub.fetch(new Request("https://internal/playlog", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "clear" })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
   if(body.action === "listInviteCodes"){
     const regId = env.FRIEND_REGISTRY.idFromName("global");
     const regStub = env.FRIEND_REGISTRY.get(regId);
@@ -1102,6 +1199,10 @@ export default {
 
     if(url.pathname === "/auth"){
       return handleAuth(request, env);
+    }
+
+    if(url.pathname === "/playlog"){
+      return handlePlayLog(request, env);
     }
 
     if(url.pathname === "/ranking"){
