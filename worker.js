@@ -860,7 +860,9 @@ export class PlayLog {
       const name = sanitizeRankingName(body.name);
       const mode = String(body.mode || "");
       const level = String(body.level || "");
-      this.entries.unshift({ name, mode, level, ts: Date.now() });
+      const matchType = String(body.matchType || "solo");
+      const opponent = sanitizeRankingName(body.opponent || "");
+      this.entries.unshift({ name, mode, level, matchType, opponent, ts: Date.now() });
       if(this.entries.length > PLAY_LOG_MAX){
         this.entries = this.entries.slice(0, PLAY_LOG_MAX);
       }
@@ -897,7 +899,7 @@ async function handlePlayLog(request, env){
   const res = await stub.fetch(new Request("https://internal/playlog", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "record", name: body.name, mode: body.mode, level: body.level })
+    body: JSON.stringify({ action: "record", name: body.name, mode: body.mode, level: body.level, matchType: body.matchType, opponent: body.opponent })
   }));
   return new Response(await res.text(), { headers: corsHeaders() });
 }
