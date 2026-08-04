@@ -861,7 +861,7 @@ export class PlayLog {
       const mode = String(body.mode || "");
       const level = String(body.level || "");
       const matchType = String(body.matchType || "solo");
-      const opponent = sanitizeRankingName(body.opponent || "");
+      const opponent = String(body.opponent || "").trim().slice(0, 6);
       this.entries.unshift({ name, mode, level, matchType, opponent, ts: Date.now() });
       if(this.entries.length > PLAY_LOG_MAX){
         this.entries = this.entries.slice(0, PLAY_LOG_MAX);
