@@ -862,7 +862,9 @@ export class PlayLog {
       const level = String(body.level || "");
       const matchType = String(body.matchType || "solo");
       const opponent = String(body.opponent || "").trim().slice(0, 6);
-      this.entries.unshift({ name, mode, level, matchType, opponent, ts: Date.now() });
+      const ip = String(body.ip || "unknown").slice(0, 64);
+      const userAgent = String(body.userAgent || "unknown").slice(0, 300);
+      this.entries.unshift({ name, mode, level, matchType, opponent, ip, userAgent, ts: Date.now() });
       if(this.entries.length > PLAY_LOG_MAX){
         this.entries = this.entries.slice(0, PLAY_LOG_MAX);
       }
@@ -894,12 +896,14 @@ async function handlePlayLog(request, env){
   }catch(e){
     body = {};
   }
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  const userAgent = request.headers.get("User-Agent") || "unknown";
   const id = env.PLAY_LOG.idFromName("global");
   const stub = env.PLAY_LOG.get(id);
   const res = await stub.fetch(new Request("https://internal/playlog", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "record", name: body.name, mode: body.mode, level: body.level, matchType: body.matchType, opponent: body.opponent })
+    body: JSON.stringify({ action: "record", name: body.name, mode: body.mode, level: body.level, matchType: body.matchType, opponent: body.opponent, ip, userAgent })
   }));
   return new Response(await res.text(), { headers: corsHeaders() });
 }
