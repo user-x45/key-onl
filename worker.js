@@ -485,11 +485,60 @@ function corsHeaders(){
   };
 }
 
+const SESSION_MIN_MS = 95000;
+const SESSION_MAX_MS = 180000;
+const SESSION_MAX_SCORE = 9000;
+const SESSION_TOKEN_TTL_MS = 300000;
+
+function bufToHex(buf){
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function hmacHex(secret, message){
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return bufToHex(sig);
+}
+
+async function issueSessionToken(env, mode, level){
+  const secret = env.ADMIN_PASSWORD || "s-typing-fallback-secret";
+  const payload = { ts: Date.now(), mode, level, nonce: crypto.randomUUID() };
+  const payloadStr = JSON.stringify(payload);
+  const payloadB64 = btoa(unescape(encodeURIComponent(payloadStr)));
+  const sig = await hmacHex(secret, payloadB64);
+  return `${payloadB64}.${sig}`;
+}
+
+async function verifySessionToken(env, token, mode, level){
+  if(typeof token !== "string" || token.indexOf(".") === -1) return null;
+  const [payloadB64, sig] = token.split(".");
+  const secret = env.ADMIN_PASSWORD || "s-typing-fallback-secret";
+  const expectedSig = await hmacHex(secret, payloadB64);
+  if(expectedSig !== sig) return null;
+  let payload;
+  try{
+    payload = JSON.parse(decodeURIComponent(escape(atob(payloadB64))));
+  }catch(e){
+    return null;
+  }
+  if(payload.mode !== mode || payload.level !== level) return null;
+  const elapsed = Date.now() - payload.ts;
+  if(elapsed < SESSION_MIN_MS || elapsed > SESSION_MAX_MS) return null;
+  return payload;
+}
+
 export class Ranking {
   constructor(state, env){
     this.state = state;
     this.env = env;
     this.scores = null;
+    this.usedNonces = null;
   }
 
   async load(){
@@ -497,12 +546,18 @@ export class Ranking {
     const stored = await this.state.storage.get("scores");
     const list = Array.isArray(stored) ? stored : [];
     this.scores = list.map(entry => typeof entry === "object" && entry !== null ? entry : { score: entry, name: "GUEST" });
+    const storedNonces = await this.state.storage.get("usedNonces");
+    this.usedNonces = Array.isArray(storedNonces) ? storedNonces : [];
   }
 
   async fetch(request){
     if(request.method === "OPTIONS"){
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
+
+    const url = new URL(request.url);
+    const mode = url.searchParams.get("mode") || "hiragana";
+    const level = url.searchParams.get("level") || "beginner";
 
     await this.load();
 
@@ -516,6 +571,11 @@ export class Ranking {
         body = await request.json();
       }catch(e){
         return new Response(JSON.stringify({ error: "invalid body" }), { status: 400, headers: corsHeaders() });
+      }
+
+      if(body.action === "startSession"){
+        const token = await issueSessionToken(this.env, mode, level);
+        return new Response(JSON.stringify({ token }), { headers: corsHeaders() });
       }
 
       if(body.action === "clear"){
@@ -534,7 +594,19 @@ export class Ranking {
         return new Response(JSON.stringify({ top20: this.scores }), { headers: corsHeaders() });
       }
 
-      const score = Math.max(0, Math.round(Number(body.score) || 0));
+      const payload = await verifySessionToken(this.env, body.token, mode, level);
+      if(!payload){
+        return new Response(JSON.stringify({ error: "invalid or expired session" }), { status: 403, headers: corsHeaders() });
+      }
+      if(this.usedNonces.some(n => n.nonce === payload.nonce)){
+        return new Response(JSON.stringify({ error: "session already used" }), { status: 403, headers: corsHeaders() });
+      }
+      const now = Date.now();
+      this.usedNonces = this.usedNonces.filter(n => n.until > now).concat([{ nonce: payload.nonce, until: now + SESSION_TOKEN_TTL_MS }]);
+      await this.state.storage.put("usedNonces", this.usedNonces);
+
+      let score = Math.max(0, Math.round(Number(body.score) || 0));
+      if(score > SESSION_MAX_SCORE) score = SESSION_MAX_SCORE;
       const name = sanitizeRankingName(body.name);
 
       let rank = null;
