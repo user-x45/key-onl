@@ -34,6 +34,10 @@ class_name = "FriendRegistry"
 name = "PLAY_LOG"
 class_name = "PlayLog"
 
+[[durable_objects.bindings]]
+name = "EVENT_SETTINGS"
+class_name = "EventSettings"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Lobby", "Match"]
@@ -61,6 +65,10 @@ new_sqlite_classes = ["FriendRegistry"]
 [[migrations]]
 tag = "v7"
 new_sqlite_classes = ["PlayLog"]
+
+[[migrations]]
+tag = "v8"
+new_sqlite_classes = ["EventSettings"]
 
 [vars]
 GOOGLE_CLIENT_ID = "7365893755-eqm3coij6otohorig4bgq4mtoen1q7sf.apps.googleusercontent.com"
