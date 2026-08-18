@@ -635,7 +635,7 @@ export class Ranking {
   }
 }
 
-const SESSION_TOKEN_TTL_MS = 400 * 24 * 60 * 60 * 1000;
+const LOGIN_SESSION_TTL_MS = 400 * 24 * 60 * 60 * 1000;
 const PENDING_TOKEN_TTL_MS = 10 * 60 * 1000;
 
 export class UserAuth {
@@ -685,7 +685,7 @@ export class UserAuth {
       const existing = this.users[sub];
       if(existing){
         const token = crypto.randomUUID();
-        this.sessions[token] = { sub, expires: Date.now() + SESSION_TOKEN_TTL_MS };
+        this.sessions[token] = { sub, expires: Date.now() + LOGIN_SESSION_TTL_MS };
         await this.state.storage.put("sessions", this.sessions);
         return new Response(JSON.stringify({ isNewUser: false, token, name: existing.name }), { headers: corsHeaders() });
       }
@@ -705,7 +705,7 @@ export class UserAuth {
       this.users[entry.sub] = { name: cleanName, highScores: {} };
       delete this.pending[pendingToken];
       const token = crypto.randomUUID();
-      this.sessions[token] = { sub: entry.sub, expires: Date.now() + SESSION_TOKEN_TTL_MS };
+      this.sessions[token] = { sub: entry.sub, expires: Date.now() + LOGIN_SESSION_TTL_MS };
       await this.state.storage.put("users", this.users);
       await this.state.storage.put("pending", this.pending);
       await this.state.storage.put("sessions", this.sessions);
