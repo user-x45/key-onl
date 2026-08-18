@@ -594,24 +594,15 @@ export class Ranking {
         return new Response(JSON.stringify({ top20: this.scores }), { headers: corsHeaders() });
       }
 
-      if(body.action === "archiveSnapshot"){
+      if(body.action === "getMonthRanking"){
         const month = String(body.month || "");
-        const key = `archive:${month}`;
-        const existing = await this.state.storage.get(key);
-        if(!existing){
-          await this.state.storage.put(key, this.scores);
-        }
-        return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
-      }
-
-      if(body.action === "getArchive"){
-        const month = String(body.month || "");
-        const key = `archive:${month}`;
-        const archived = (await this.state.storage.get(key)) || [];
-        return new Response(JSON.stringify({ top20: archived }), { headers: corsHeaders() });
+        const key = `monthScores:${month}`;
+        const monthScores = (await this.state.storage.get(key)) || [];
+        return new Response(JSON.stringify({ top20: monthScores }), { headers: corsHeaders() });
       }
 
       let eventEnabled = false;
+      let eventMonth = "";
       if(this.env.EVENT_SETTINGS){
         const eventId = this.env.EVENT_SETTINGS.idFromName("global");
         const eventStub = this.env.EVENT_SETTINGS.get(eventId);
@@ -622,6 +613,7 @@ export class Ranking {
         }));
         const eventData = await eventRes.json();
         eventEnabled = Boolean(eventData.enabled);
+        eventMonth = String(eventData.month || "");
       }
 
       const payload = await verifySessionToken(this.env, body.token, mode, level);
@@ -640,7 +632,25 @@ export class Ranking {
       const name = sanitizeRankingName(body.name);
 
       if(eventEnabled){
-        return new Response(JSON.stringify({ rank: null, top20: this.scores, eventMode: true }), { headers: corsHeaders() });
+        const key = `monthScores:${eventMonth}`;
+        const monthScores = (await this.state.storage.get(key)) || [];
+        let monthRank = null;
+        const existingMonthIndex = monthScores.findIndex(s => s.score === score && s.name === name);
+        if(existingMonthIndex !== -1){
+          monthRank = existingMonthIndex < RANKING_MAX ? existingMonthIndex + 1 : null;
+        } else {
+          let pos = 0;
+          while(pos < monthScores.length && monthScores[pos].score > score) pos++;
+          if(pos < RANKING_MAX){
+            monthScores.splice(pos, 0, { score, name });
+            if(monthScores.length > RANKING_MAX){
+              monthScores.length = RANKING_MAX;
+            }
+            monthRank = pos + 1;
+            await this.state.storage.put(key, monthScores);
+          }
+        }
+        return new Response(JSON.stringify({ rank: monthRank, top20: monthScores, eventMode: true, month: eventMonth }), { headers: corsHeaders() });
       }
 
       let rank = null;
@@ -1282,19 +1292,6 @@ async function handleAdmin(request, env){
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "set", enabled, month })
     }));
-    if(enabled){
-      for(const mode of RANKING_MODES){
-        for(const level of RANKING_LEVELS){
-          const id = env.RANKING.idFromName(`${mode}:${level}`);
-          const stub = env.RANKING.get(id);
-          await stub.fetch(new Request("https://internal/ranking", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ action: "archiveSnapshot", month })
-          }));
-        }
-      }
-    }
     return new Response(await res.text(), { headers: corsHeaders() });
   }
 
@@ -1308,7 +1305,7 @@ async function handleAdmin(request, env){
         const res = await stub.fetch(new Request("https://internal/ranking", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "getArchive", month })
+          body: JSON.stringify({ action: "getMonthRanking", month })
         }));
         const data = await res.json();
         result[`${mode}:${level}`] = data.top20 || [];
