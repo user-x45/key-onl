@@ -594,6 +594,36 @@ export class Ranking {
         return new Response(JSON.stringify({ top20: this.scores }), { headers: corsHeaders() });
       }
 
+      if(body.action === "archiveSnapshot"){
+        const month = String(body.month || "");
+        const key = `archive:${month}`;
+        const existing = await this.state.storage.get(key);
+        if(!existing){
+          await this.state.storage.put(key, this.scores);
+        }
+        return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
+      }
+
+      if(body.action === "getArchive"){
+        const month = String(body.month || "");
+        const key = `archive:${month}`;
+        const archived = (await this.state.storage.get(key)) || [];
+        return new Response(JSON.stringify({ top20: archived }), { headers: corsHeaders() });
+      }
+
+      let eventEnabled = false;
+      if(this.env.EVENT_SETTINGS){
+        const eventId = this.env.EVENT_SETTINGS.idFromName("global");
+        const eventStub = this.env.EVENT_SETTINGS.get(eventId);
+        const eventRes = await eventStub.fetch(new Request("https://internal/event", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "get" })
+        }));
+        const eventData = await eventRes.json();
+        eventEnabled = Boolean(eventData.enabled);
+      }
+
       const payload = await verifySessionToken(this.env, body.token, mode, level);
       if(!payload){
         return new Response(JSON.stringify({ error: "invalid or expired session" }), { status: 403, headers: corsHeaders() });
@@ -608,6 +638,10 @@ export class Ranking {
       let score = Math.max(0, Math.round(Number(body.score) || 0));
       if(score > SESSION_MAX_SCORE) score = SESSION_MAX_SCORE;
       const name = sanitizeRankingName(body.name);
+
+      if(eventEnabled){
+        return new Response(JSON.stringify({ rank: null, top20: this.scores, eventMode: true }), { headers: corsHeaders() });
+      }
 
       let rank = null;
       const existingIndex = this.scores.findIndex(s => s.score === score && s.name === name);
@@ -632,6 +666,47 @@ export class Ranking {
     }
 
     return new Response("method not allowed", { status: 405, headers: corsHeaders() });
+  }
+}
+
+export class EventSettings {
+  constructor(state, env){
+    this.state = state;
+    this.env = env;
+    this.settings = null;
+  }
+
+  async load(){
+    if(this.settings) return;
+    const stored = await this.state.storage.get("settings");
+    this.settings = stored || { enabled: false, month: "" };
+  }
+
+  async fetch(request){
+    if(request.method === "OPTIONS"){
+      return new Response(null, { status: 204, headers: corsHeaders() });
+    }
+
+    await this.load();
+
+    let body = {};
+    try{
+      body = await request.json();
+    }catch(e){
+      body = {};
+    }
+
+    if(body.action === "get"){
+      return new Response(JSON.stringify(this.settings), { headers: corsHeaders() });
+    }
+
+    if(body.action === "set"){
+      this.settings = { enabled: Boolean(body.enabled), month: String(body.month || "") };
+      await this.state.storage.put("settings", this.settings);
+      return new Response(JSON.stringify(this.settings), { headers: corsHeaders() });
+    }
+
+    return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
   }
 }
 
@@ -1185,6 +1260,61 @@ async function handleAdmin(request, env){
       body: JSON.stringify({ action: "clear" })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "getEventMode"){
+    const eventId = env.EVENT_SETTINGS.idFromName("global");
+    const eventStub = env.EVENT_SETTINGS.get(eventId);
+    const res = await eventStub.fetch(new Request("https://internal/event", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "get" })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "setEventMode"){
+    const { enabled, month } = body;
+    const eventId = env.EVENT_SETTINGS.idFromName("global");
+    const eventStub = env.EVENT_SETTINGS.get(eventId);
+    const res = await eventStub.fetch(new Request("https://internal/event", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "set", enabled, month })
+    }));
+    if(enabled){
+      for(const mode of RANKING_MODES){
+        for(const level of RANKING_LEVELS){
+          const id = env.RANKING.idFromName(`${mode}:${level}`);
+          const stub = env.RANKING.get(id);
+          await stub.fetch(new Request("https://internal/ranking", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "archiveSnapshot", month })
+          }));
+        }
+      }
+    }
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "getEventArchive"){
+    const { month } = body;
+    const result = {};
+    for(const mode of RANKING_MODES){
+      for(const level of RANKING_LEVELS){
+        const id = env.RANKING.idFromName(`${mode}:${level}`);
+        const stub = env.RANKING.get(id);
+        const res = await stub.fetch(new Request("https://internal/ranking", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "getArchive", month })
+        }));
+        const data = await res.json();
+        result[`${mode}:${level}`] = data.top20 || [];
+      }
+    }
+    return new Response(JSON.stringify(result), { headers: corsHeaders() });
   }
 
   if(body.action === "listUsers"){
