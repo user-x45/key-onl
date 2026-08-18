@@ -1415,6 +1415,34 @@ export default {
       const level = url.searchParams.get("level") || "beginner";
       const id = env.RANKING.idFromName(`${mode}:${level}`);
       const stub = env.RANKING.get(id);
+      if(request.method === "GET"){
+        let eventEnabled = false;
+        let eventMonth = "";
+        if(env.EVENT_SETTINGS){
+          const eventId = env.EVENT_SETTINGS.idFromName("global");
+          const eventStub = env.EVENT_SETTINGS.get(eventId);
+          const eventRes = await eventStub.fetch(new Request("https://internal/event", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "get" })
+          }));
+          const eventData = await eventRes.json();
+          eventEnabled = Boolean(eventData.enabled);
+          eventMonth = String(eventData.month || "");
+        }
+        if(eventEnabled){
+          const res = await stub.fetch(new Request("https://internal/ranking", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "getMonthRanking", month: eventMonth })
+          }));
+          const data = await res.json();
+          return new Response(JSON.stringify({ scores: data.top20 || [], eventMode: true, month: eventMonth }), { headers: corsHeaders() });
+        }
+        const res = await stub.fetch(request);
+        const scores = await res.json();
+        return new Response(JSON.stringify({ scores, eventMode: false, month: "" }), { headers: corsHeaders() });
+      }
       return stub.fetch(request);
     }
 
