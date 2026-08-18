@@ -476,6 +476,14 @@ function sanitizeRankingName(raw){
   return trimmed.length === 0 ? "GUEST" : trimmed;
 }
 
+function getCurrentMonthJST(){
+  const now = new Date();
+  const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+  const year = jst.getUTCFullYear();
+  const month = String(jst.getUTCMonth() + 1).padStart(2, "0");
+  return `${year}-${month}`;
+}
+
 function corsHeaders(){
   return {
     "Access-Control-Allow-Origin": "*",
@@ -631,7 +639,9 @@ export class Ranking {
       if(score > SESSION_MAX_SCORE) score = SESSION_MAX_SCORE;
       const name = sanitizeRankingName(body.name);
 
-      if(eventEnabled){
+      const activeEventMonth = eventEnabled && eventMonth === getCurrentMonthJST();
+
+      if(activeEventMonth){
         const key = `monthScores:${eventMonth}`;
         const monthScores = (await this.state.storage.get(key)) || [];
         let monthRank = null;
@@ -1430,7 +1440,7 @@ export default {
           eventEnabled = Boolean(eventData.enabled);
           eventMonth = String(eventData.month || "");
         }
-        if(eventEnabled){
+        if(eventEnabled && eventMonth === getCurrentMonthJST()){
           const res = await stub.fetch(new Request("https://internal/ranking", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
