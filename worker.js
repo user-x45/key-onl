@@ -609,6 +609,26 @@ export class Ranking {
         return new Response(JSON.stringify({ top20: monthScores }), { headers: corsHeaders() });
       }
 
+      if(body.action === "clearMonthRanking"){
+        const month = String(body.month || "");
+        const key = `monthScores:${month}`;
+        await this.state.storage.put(key, []);
+        return new Response(JSON.stringify({ top20: [] }), { headers: corsHeaders() });
+      }
+
+      if(body.action === "deleteMonthRanking"){
+        const month = String(body.month || "");
+        const key = `monthScores:${month}`;
+        const monthScores = (await this.state.storage.get(key)) || [];
+        const target = Math.round(Number(body.score));
+        const idx = monthScores.findIndex(s => s.score === target);
+        if(idx !== -1){
+          monthScores.splice(idx, 1);
+          await this.state.storage.put(key, monthScores);
+        }
+        return new Response(JSON.stringify({ top20: monthScores }), { headers: corsHeaders() });
+      }
+
       let eventEnabled = false;
       let eventMonth = "";
       if(this.env.EVENT_SETTINGS){
@@ -1322,6 +1342,30 @@ async function handleAdmin(request, env){
       }
     }
     return new Response(JSON.stringify(result), { headers: corsHeaders() });
+  }
+
+  if(body.action === "clearMonthRanking"){
+    const { mode, level, month } = body;
+    const id = env.RANKING.idFromName(`${mode}:${level}`);
+    const stub = env.RANKING.get(id);
+    const res = await stub.fetch(new Request("https://internal/ranking", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "clearMonthRanking", month })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "deleteMonthRanking"){
+    const { mode, level, month, score } = body;
+    const id = env.RANKING.idFromName(`${mode}:${level}`);
+    const stub = env.RANKING.get(id);
+    const res = await stub.fetch(new Request("https://internal/ranking", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "deleteMonthRanking", month, score })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
   }
 
   if(body.action === "listUsers"){
