@@ -802,7 +802,7 @@ export class UserAuth {
         const token = crypto.randomUUID();
         this.sessions[token] = { sub, expires: Date.now() + LOGIN_SESSION_TTL_MS };
         await this.state.storage.put("sessions", this.sessions);
-        return new Response(JSON.stringify({ isNewUser: false, token, name: existing.name }), { headers: corsHeaders() });
+        return new Response(JSON.stringify({ isNewUser: false, token, name: existing.name, inputMode: existing.inputMode || null }), { headers: corsHeaders() });
       }
       const pendingToken = crypto.randomUUID();
       this.pending[pendingToken] = { sub, expires: Date.now() + PENDING_TOKEN_TTL_MS };
@@ -836,7 +836,7 @@ export class UserAuth {
       if(!user){
         return new Response(JSON.stringify({ valid: false }), { headers: corsHeaders() });
       }
-      return new Response(JSON.stringify({ valid: true, name: user.name }), { headers: corsHeaders() });
+      return new Response(JSON.stringify({ valid: true, name: user.name, inputMode: user.inputMode || null }), { headers: corsHeaders() });
     }
 
     if(body.action === "getHighScores"){
@@ -884,6 +884,21 @@ export class UserAuth {
       user.name = cleanName;
       await this.state.storage.put("users", this.users);
       return new Response(JSON.stringify({ ok: true, name: cleanName }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "setInputMode"){
+      const entry = this.sessions[body.token];
+      if(!entry || entry.expires < Date.now()){
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+      }
+      const user = this.users[entry.sub];
+      if(!user){
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+      }
+      const inputMode = body.inputMode === "textbox" ? "textbox" : "realtime";
+      user.inputMode = inputMode;
+      await this.state.storage.put("users", this.users);
+      return new Response(JSON.stringify({ ok: true, inputMode }), { headers: corsHeaders() });
     }
 
     if(body.action === "logout"){
@@ -998,6 +1013,15 @@ async function handleAuth(request, env){
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "setName", token: body.token, name: body.name })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "setInputMode"){
+    const res = await authStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "setInputMode", token: body.token, inputMode: body.inputMode })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
