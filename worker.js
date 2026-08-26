@@ -493,8 +493,8 @@ function corsHeaders(){
   };
 }
 
-const SESSION_MIN_MS = 95000;
-const SESSION_MAX_MS = 180000;
+const SESSION_MIN_MS = 80000;
+const SESSION_MAX_MS = 240000;
 const SESSION_MAX_SCORE = 9000;
 const SESSION_TOKEN_TTL_MS = 300000;
 
