@@ -467,9 +467,6 @@ export class Match {
   }
 }
 
-const DEVICE_ADMIN_SUB = "109772700096398272929";
-const DEVICE_ADMIN_NAME = "あすか";
-
 const RANKING_MAX = 20;
 const RANKING_MODES = ["hiragana", "katakana", "sentence"];
 const RANKING_LEVELS = ["beginner", "intermediate", "advanced"];
@@ -799,11 +796,11 @@ export class UserAuth {
     }
 
     if(body.action === "resolveLogin"){
-      const { sub, userAgent, ip } = body;
+      const { sub } = body;
       const existing = this.users[sub];
       if(existing){
         const token = crypto.randomUUID();
-        this.sessions[token] = { sub, expires: Date.now() + LOGIN_SESSION_TTL_MS, userAgent: userAgent || "unknown", ip: ip || "unknown", loginAt: Date.now() };
+        this.sessions[token] = { sub, expires: Date.now() + LOGIN_SESSION_TTL_MS };
         await this.state.storage.put("sessions", this.sessions);
         return new Response(JSON.stringify({ isNewUser: false, token, name: existing.name, inputMode: existing.inputMode || null }), { headers: corsHeaders() });
       }
@@ -814,7 +811,7 @@ export class UserAuth {
     }
 
     if(body.action === "register"){
-      const { pendingToken, name, userAgent, ip } = body;
+      const { pendingToken, name } = body;
       const entry = this.pending[pendingToken];
       if(!entry || entry.expires < Date.now()){
         return new Response(JSON.stringify({ error: "invalid pending token" }), { status: 400, headers: corsHeaders() });
@@ -823,7 +820,7 @@ export class UserAuth {
       this.users[entry.sub] = { name: cleanName, highScores: {} };
       delete this.pending[pendingToken];
       const token = crypto.randomUUID();
-      this.sessions[token] = { sub: entry.sub, expires: Date.now() + LOGIN_SESSION_TTL_MS, userAgent: userAgent || "unknown", ip: ip || "unknown", loginAt: Date.now() };
+      this.sessions[token] = { sub: entry.sub, expires: Date.now() + LOGIN_SESSION_TTL_MS };
       await this.state.storage.put("users", this.users);
       await this.state.storage.put("pending", this.pending);
       await this.state.storage.put("sessions", this.sessions);
@@ -933,31 +930,6 @@ export class UserAuth {
       return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
     }
 
-    if(body.action === "listSessions"){
-      const list = Object.keys(this.sessions).map(token => {
-        const s = this.sessions[token];
-        const user = this.users[s.sub];
-        return {
-          token,
-          sub: s.sub,
-          name: user ? user.name : "GUEST",
-          userAgent: s.userAgent || "unknown",
-          ip: s.ip || "unknown",
-          loginAt: s.loginAt || null
-        };
-      });
-      return new Response(JSON.stringify({ sessions: list }), { headers: corsHeaders() });
-    }
-
-    if(body.action === "revokeSession"){
-      const { token } = body;
-      if(this.sessions[token]){
-        delete this.sessions[token];
-        await this.state.storage.put("sessions", this.sessions);
-      }
-      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
-    }
-
     return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
   }
 }
@@ -992,23 +964,19 @@ async function handleAuth(request, env){
     if(!payload){
       return new Response(JSON.stringify({ error: "invalid id token" }), { status: 401, headers: corsHeaders() });
     }
-    const userAgent = request.headers.get("User-Agent") || "unknown";
-    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
     const res = await authStub.fetch(new Request("https://internal/auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "resolveLogin", sub: payload.sub, userAgent, ip })
+      body: JSON.stringify({ action: "resolveLogin", sub: payload.sub })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
 
   if(body.action === "register"){
-    const userAgent = request.headers.get("User-Agent") || "unknown";
-    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
     const res = await authStub.fetch(new Request("https://internal/auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "register", pendingToken: body.pendingToken, name: body.name, userAgent, ip })
+      body: JSON.stringify({ action: "register", pendingToken: body.pendingToken, name: body.name })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
@@ -1319,44 +1287,6 @@ async function handleAdmin(request, env){
   const verifyData = await verifyRes.json();
   if(!verifyData.valid){
     return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
-  }
-
-  if(body.action === "verifyDeviceAdmin"){
-    const payload = await verifyGoogleIdToken(body.idToken, env.GOOGLE_CLIENT_ID);
-    if(!payload || payload.sub !== DEVICE_ADMIN_SUB){
-      return new Response(JSON.stringify({ ok: false }), { status: 403, headers: corsHeaders() });
-    }
-    return new Response(JSON.stringify({ ok: true, name: DEVICE_ADMIN_NAME }), { headers: corsHeaders() });
-  }
-
-  if(body.action === "listDevices"){
-    const payload = await verifyGoogleIdToken(body.idToken, env.GOOGLE_CLIENT_ID);
-    if(!payload || payload.sub !== DEVICE_ADMIN_SUB){
-      return new Response(JSON.stringify({ error: "forbidden" }), { status: 403, headers: corsHeaders() });
-    }
-    const userAuthId = env.USER_AUTH.idFromName("global");
-    const userAuthStub = env.USER_AUTH.get(userAuthId);
-    const res = await userAuthStub.fetch(new Request("https://internal/auth", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "listSessions" })
-    }));
-    return new Response(await res.text(), { headers: corsHeaders() });
-  }
-
-  if(body.action === "revokeDevice"){
-    const payload = await verifyGoogleIdToken(body.idToken, env.GOOGLE_CLIENT_ID);
-    if(!payload || payload.sub !== DEVICE_ADMIN_SUB){
-      return new Response(JSON.stringify({ error: "forbidden" }), { status: 403, headers: corsHeaders() });
-    }
-    const userAuthId = env.USER_AUTH.idFromName("global");
-    const userAuthStub = env.USER_AUTH.get(userAuthId);
-    const res = await userAuthStub.fetch(new Request("https://internal/auth", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "revokeSession", token: body.deviceToken })
-    }));
-    return new Response(await res.text(), { headers: corsHeaders() });
   }
 
   if(body.action === "list" || !body.action){
