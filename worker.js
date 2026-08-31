@@ -937,7 +937,8 @@ export class UserAuth {
         playedAt: Date.now(),
         accuracy: Number(body.accuracy) || 0,
         speed: Number(body.speed) || 0,
-        miss: Number(body.miss) || 0
+        miss: Number(body.miss) || 0,
+        score: Number(body.score) || 0
       };
       if(!user.playRecords) user.playRecords = [];
       user.playRecords.unshift(record);
@@ -1096,7 +1097,7 @@ async function handleAuth(request, env){
     const res = await authStub.fetch(new Request("https://internal/auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "addPlayRecord", token: body.token, mode: body.mode, level: body.level, accuracy: body.accuracy, speed: body.speed, miss: body.miss })
+      body: JSON.stringify({ action: "addPlayRecord", token: body.token, mode: body.mode, level: body.level, accuracy: body.accuracy, speed: body.speed, miss: body.miss, score: body.score })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
