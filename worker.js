@@ -753,6 +753,8 @@ export class EventSettings {
 const LOGIN_SESSION_TTL_MS = 400 * 24 * 60 * 60 * 1000;
 const PENDING_TOKEN_TTL_MS = 10 * 60 * 1000;
 
+const PLAY_RECORD_MAX = 20;
+
 export class UserAuth {
   constructor(state, env){
     this.state = state;
@@ -920,6 +922,42 @@ export class UserAuth {
       return new Response(JSON.stringify({ ok: true, displaySettings }), { headers: corsHeaders() });
     }
 
+    if(body.action === "addPlayRecord"){
+      const entry = this.sessions[body.token];
+      if(!entry || entry.expires < Date.now()){
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+      }
+      const user = this.users[entry.sub];
+      if(!user){
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+      }
+      const record = {
+        mode: String(body.mode || ""),
+        level: String(body.level || ""),
+        playedAt: Date.now(),
+        accuracy: Number(body.accuracy) || 0,
+        speed: Number(body.speed) || 0,
+        miss: Number(body.miss) || 0
+      };
+      if(!user.playRecords) user.playRecords = [];
+      user.playRecords.unshift(record);
+      user.playRecords = user.playRecords.slice(0, PLAY_RECORD_MAX);
+      await this.state.storage.put("users", this.users);
+      return new Response(JSON.stringify({ ok: true, playRecords: user.playRecords }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "getPlayRecords"){
+      const entry = this.sessions[body.token];
+      if(!entry || entry.expires < Date.now()){
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+      }
+      const user = this.users[entry.sub];
+      if(!user){
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+      }
+      return new Response(JSON.stringify({ playRecords: user.playRecords || [] }), { headers: corsHeaders() });
+    }
+
     if(body.action === "logout"){
       delete this.sessions[body.token];
       await this.state.storage.put("sessions", this.sessions);
@@ -1050,6 +1088,24 @@ async function handleAuth(request, env){
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "setDisplaySettings", token: body.token, showRomaji: body.showRomaji, showFurigana: body.showFurigana, romajiUppercase: body.romajiUppercase })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "addPlayRecord"){
+    const res = await authStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "addPlayRecord", token: body.token, mode: body.mode, level: body.level, accuracy: body.accuracy, speed: body.speed, miss: body.miss })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "getPlayRecords"){
+    const res = await authStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "getPlayRecords", token: body.token })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
