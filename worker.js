@@ -802,7 +802,7 @@ export class UserAuth {
         const token = crypto.randomUUID();
         this.sessions[token] = { sub, expires: Date.now() + LOGIN_SESSION_TTL_MS };
         await this.state.storage.put("sessions", this.sessions);
-        return new Response(JSON.stringify({ isNewUser: false, token, name: existing.name, inputMode: existing.inputMode || null }), { headers: corsHeaders() });
+        return new Response(JSON.stringify({ isNewUser: false, token, name: existing.name, inputMode: existing.inputMode || null, displaySettings: existing.displaySettings || null }), { headers: corsHeaders() });
       }
       const pendingToken = crypto.randomUUID();
       this.pending[pendingToken] = { sub, expires: Date.now() + PENDING_TOKEN_TTL_MS };
@@ -836,7 +836,7 @@ export class UserAuth {
       if(!user){
         return new Response(JSON.stringify({ valid: false }), { headers: corsHeaders() });
       }
-      return new Response(JSON.stringify({ valid: true, name: user.name, inputMode: user.inputMode || null }), { headers: corsHeaders() });
+      return new Response(JSON.stringify({ valid: true, name: user.name, inputMode: user.inputMode || null, displaySettings: user.displaySettings || null }), { headers: corsHeaders() });
     }
 
     if(body.action === "getHighScores"){
@@ -899,6 +899,25 @@ export class UserAuth {
       user.inputMode = inputMode;
       await this.state.storage.put("users", this.users);
       return new Response(JSON.stringify({ ok: true, inputMode }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "setDisplaySettings"){
+      const entry = this.sessions[body.token];
+      if(!entry || entry.expires < Date.now()){
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+      }
+      const user = this.users[entry.sub];
+      if(!user){
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+      }
+      const displaySettings = {
+        showRomaji: body.showRomaji !== false,
+        showFurigana: body.showFurigana !== false,
+        romajiUppercase: body.romajiUppercase === true
+      };
+      user.displaySettings = displaySettings;
+      await this.state.storage.put("users", this.users);
+      return new Response(JSON.stringify({ ok: true, displaySettings }), { headers: corsHeaders() });
     }
 
     if(body.action === "logout"){
@@ -1022,6 +1041,15 @@ async function handleAuth(request, env){
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "setInputMode", token: body.token, inputMode: body.inputMode })
+    }));
+    return new Response(await res.text(), { headers: corsHeaders() });
+  }
+
+  if(body.action === "setDisplaySettings"){
+    const res = await authStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "setDisplaySettings", token: body.token, showRomaji: body.showRomaji, showFurigana: body.showFurigana, romajiUppercase: body.romajiUppercase })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
