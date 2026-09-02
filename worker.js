@@ -938,8 +938,7 @@ export class UserAuth {
         accuracy: Number(body.accuracy) || 0,
         speed: Number(body.speed) || 0,
         miss: Number(body.miss) || 0,
-        score: Number(body.score) || 0,
-        name: user.name || "GUEST"
+        score: Number(body.score) || 0
       };
       if(!user.playRecords) user.playRecords = [];
       user.playRecords.unshift(record);
