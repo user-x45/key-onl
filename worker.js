@@ -1,41 +1,6 @@
 const WORDS_BASE_URL = "https://s-typing.f5.si/words";
 const wordListCache = {};
 
-async function moderateName(name, env){
-  if(!name){
-    return { configured: Boolean(env.OPENAI_API_KEY), requestOk: true, flagged: false, categories: [], error: null };
-  }
-  if(!env.OPENAI_API_KEY){
-    return { configured: false, requestOk: false, flagged: false, categories: [], error: "OPENAI_API_KEY not set" };
-  }
-  try{
-    const res = await fetch("https://api.openai.com/v1/moderations", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${env.OPENAI_API_KEY}`
-      },
-      body: JSON.stringify({ model: "omni-moderation-latest", input: name })
-    });
-    if(!res.ok){
-      const text = await res.text();
-      return { configured: true, requestOk: false, flagged: false, categories: [], error: `HTTP ${res.status}: ${text.slice(0, 200)}` };
-    }
-    const data = await res.json();
-    const result = data.results && data.results[0];
-    const flagged = Boolean(result && result.flagged);
-    const categories = result && result.categories ? Object.keys(result.categories).filter(k => result.categories[k]) : [];
-    return { configured: true, requestOk: true, flagged, categories, error: null };
-  }catch(e){
-    return { configured: true, requestOk: false, flagged: false, categories: [], error: String(e) };
-  }
-}
-
-async function isNameFlagged(name, env){
-  const result = await moderateName(name, env);
-  return result.flagged;
-}
-
 async function fetchWordList(mode, level){
   const cacheKey = `${mode}-${level}`;
   if(wordListCache[cacheKey]) return wordListCache[cacheKey];
@@ -77,9 +42,6 @@ export class Lobby {
     const mode = url.searchParams.get("mode") || "hiragana";
     const level = url.searchParams.get("level") || "beginner";
     const name = String(url.searchParams.get("name") || "GUEST").trim().slice(0, 6) || "GUEST";
-    if(await isNameFlagged(name, this.env)){
-      return new Response("invalid name", { status: 400 });
-    }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
@@ -232,9 +194,6 @@ export class FriendRoom {
     }
 
     const name = String(url.searchParams.get("name") || "GUEST").trim().slice(0, 6) || "GUEST";
-    if(await isNameFlagged(name, this.env)){
-      return new Response("invalid name", { status: 400 });
-    }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
@@ -860,9 +819,6 @@ export class UserAuth {
         return new Response(JSON.stringify({ error: "invalid pending token" }), { status: 400, headers: corsHeaders() });
       }
       const cleanName = (name || "").trim().slice(0, 6) || "GUEST";
-      if(await isNameFlagged(cleanName, this.env)){
-        return new Response(JSON.stringify({ error: "invalid name" }), { status: 400, headers: corsHeaders() });
-      }
       this.users[entry.sub] = { name: cleanName, highScores: {} };
       delete this.pending[pendingToken];
       const token = crypto.randomUUID();
@@ -927,9 +883,6 @@ export class UserAuth {
         return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
       }
       const cleanName = (body.name || "").trim().slice(0, 6) || "GUEST";
-      if(await isNameFlagged(cleanName, this.env)){
-        return new Response(JSON.stringify({ error: "invalid name" }), { status: 400, headers: corsHeaders() });
-      }
       user.name = cleanName;
       await this.state.storage.put("users", this.users);
       return new Response(JSON.stringify({ ok: true, name: cleanName }), { headers: corsHeaders() });
@@ -1075,19 +1028,6 @@ async function handleAuth(request, env){
       body: JSON.stringify({ action: "resolveLogin", sub: payload.sub })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
-  }
-
-  if(body.action === "checkName"){
-    const name = String(body.name || "").trim().slice(0, 6);
-    const result = await moderateName(name, env);
-    return new Response(JSON.stringify({
-      ok: !result.flagged,
-      configured: result.configured,
-      requestOk: result.requestOk,
-      flagged: result.flagged,
-      categories: result.categories,
-      error: result.error
-    }), { headers: corsHeaders() });
   }
 
   if(body.action === "register"){
