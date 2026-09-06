@@ -1,9 +1,13 @@
 const WORDS_BASE_URL = "https://s-typing.f5.si/words";
 const wordListCache = {};
 
-async function isNameFlagged(name, env){
-  if(!name) return false;
-  if(!env.OPENAI_API_KEY) return false;
+async function moderateName(name, env){
+  if(!name){
+    return { configured: Boolean(env.OPENAI_API_KEY), requestOk: true, flagged: false, categories: [], error: null };
+  }
+  if(!env.OPENAI_API_KEY){
+    return { configured: false, requestOk: false, flagged: false, categories: [], error: "OPENAI_API_KEY not set" };
+  }
   try{
     const res = await fetch("https://api.openai.com/v1/moderations", {
       method: "POST",
@@ -13,12 +17,23 @@ async function isNameFlagged(name, env){
       },
       body: JSON.stringify({ model: "omni-moderation-latest", input: name })
     });
-    if(!res.ok) return false;
+    if(!res.ok){
+      const text = await res.text();
+      return { configured: true, requestOk: false, flagged: false, categories: [], error: `HTTP ${res.status}: ${text.slice(0, 200)}` };
+    }
     const data = await res.json();
-    return Boolean(data.results && data.results[0] && data.results[0].flagged);
+    const result = data.results && data.results[0];
+    const flagged = Boolean(result && result.flagged);
+    const categories = result && result.categories ? Object.keys(result.categories).filter(k => result.categories[k]) : [];
+    return { configured: true, requestOk: true, flagged, categories, error: null };
   }catch(e){
-    return false;
+    return { configured: true, requestOk: false, flagged: false, categories: [], error: String(e) };
   }
+}
+
+async function isNameFlagged(name, env){
+  const result = await moderateName(name, env);
+  return result.flagged;
 }
 
 async function fetchWordList(mode, level){
@@ -1064,8 +1079,15 @@ async function handleAuth(request, env){
 
   if(body.action === "checkName"){
     const name = String(body.name || "").trim().slice(0, 6);
-    const flagged = await isNameFlagged(name, env);
-    return new Response(JSON.stringify({ ok: !flagged }), { headers: corsHeaders() });
+    const result = await moderateName(name, env);
+    return new Response(JSON.stringify({
+      ok: !result.flagged,
+      configured: result.configured,
+      requestOk: result.requestOk,
+      flagged: result.flagged,
+      categories: result.categories,
+      error: result.error
+    }), { headers: corsHeaders() });
   }
 
   if(body.action === "register"){
