@@ -62,6 +62,9 @@ export class Lobby {
     const mode = url.searchParams.get("mode") || "hiragana";
     const level = url.searchParams.get("level") || "beginner";
     const name = String(url.searchParams.get("name") || "GUEST").trim().slice(0, 6) || "GUEST";
+    if(await isNameFlagged(name, this.env)){
+      return new Response("invalid name", { status: 400 });
+    }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
@@ -214,6 +217,9 @@ export class FriendRoom {
     }
 
     const name = String(url.searchParams.get("name") || "GUEST").trim().slice(0, 6) || "GUEST";
+    if(await isNameFlagged(name, this.env)){
+      return new Response("invalid name", { status: 400 });
+    }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     server.accept();
