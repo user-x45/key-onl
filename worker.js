@@ -1062,6 +1062,12 @@ async function handleAuth(request, env){
     return new Response(await res.text(), { headers: corsHeaders() });
   }
 
+  if(body.action === "checkName"){
+    const name = String(body.name || "").trim().slice(0, 6);
+    const flagged = await isNameFlagged(name, env);
+    return new Response(JSON.stringify({ ok: !flagged }), { headers: corsHeaders() });
+  }
+
   if(body.action === "register"){
     const res = await authStub.fetch(new Request("https://internal/auth", {
       method: "POST",
