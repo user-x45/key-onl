@@ -848,7 +848,8 @@ export class UserAuth {
       const displaySettings = {
         showRomaji: body.showRomaji !== false,
         showHiragana: body.showHiragana !== false,
-        romajiUppercase: body.romajiUppercase === true
+        romajiUppercase: body.romajiUppercase === true,
+        showKeyboard: body.showKeyboard !== false
       };
       user.displaySettings = displaySettings;
       await this.state.storage.put("users", this.users);
@@ -1021,7 +1022,7 @@ async function handleAuth(request, env){
     const res = await authStub.fetch(new Request("https://internal/auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "setDisplaySettings", token: body.token, showRomaji: body.showRomaji, showHiragana: body.showHiragana, romajiUppercase: body.romajiUppercase })
+      body: JSON.stringify({ action: "setDisplaySettings", token: body.token, showRomaji: body.showRomaji, showHiragana: body.showHiragana, romajiUppercase: body.romajiUppercase, showKeyboard: body.showKeyboard })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
