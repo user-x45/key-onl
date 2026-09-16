@@ -576,7 +576,7 @@ export class Ranking {
 
       let eventEnabled = false;
       let eventMonth = "";
-      let eventModes = [];
+      let eventCombos = [];
       if(this.env.EVENT_SETTINGS){
         const eventId = this.env.EVENT_SETTINGS.idFromName("global");
         const eventStub = this.env.EVENT_SETTINGS.get(eventId);
@@ -588,13 +588,13 @@ export class Ranking {
         const eventData = await eventRes.json();
         eventEnabled = Boolean(eventData.enabled);
         eventMonth = String(eventData.month || "");
-        eventModes = Array.isArray(eventData.modes) ? eventData.modes : [];
+        eventCombos = Array.isArray(eventData.combos) ? eventData.combos : [];
       }
 
       const score = Math.max(0, Math.round(Number(body.score) || 0));
       const name = sanitizeRankingName(body.name);
 
-      let activeEventMonth = eventEnabled && eventMonth === getCurrentMonthJST() && eventModes.includes(mode);
+      let activeEventMonth = eventEnabled && eventMonth === getCurrentMonthJST() && eventCombos.includes(`${mode}:${level}`);
       if(body.__forceNormal){
         activeEventMonth = false;
       } else if(body.__forceEvent){
@@ -651,6 +651,8 @@ export class Ranking {
 }
 
 const EVENT_MODES = ["hiragana", "katakana", "sentence"];
+const EVENT_LEVELS = ["beginner", "intermediate", "advanced"];
+const EVENT_COMBOS = EVENT_MODES.flatMap(mode => EVENT_LEVELS.map(level => `${mode}:${level}`));
 
 export class EventSettings {
   constructor(state, env){
@@ -662,9 +664,9 @@ export class EventSettings {
   async load(){
     if(this.settings) return;
     const stored = await this.state.storage.get("settings");
-    this.settings = stored || { enabled: false, month: "", modes: EVENT_MODES.slice() };
-    if(!Array.isArray(this.settings.modes)){
-      this.settings.modes = EVENT_MODES.slice();
+    this.settings = stored || { enabled: false, month: "", combos: EVENT_COMBOS.slice() };
+    if(!Array.isArray(this.settings.combos)){
+      this.settings.combos = EVENT_COMBOS.slice();
     }
   }
 
@@ -687,10 +689,10 @@ export class EventSettings {
     }
 
     if(body.action === "set"){
-      const modes = Array.isArray(body.modes)
-        ? body.modes.filter(m => EVENT_MODES.includes(m))
-        : EVENT_MODES.slice();
-      this.settings = { enabled: Boolean(body.enabled), month: String(body.month || ""), modes };
+      const combos = Array.isArray(body.combos)
+        ? body.combos.filter(c => EVENT_COMBOS.includes(c))
+        : EVENT_COMBOS.slice();
+      this.settings = { enabled: Boolean(body.enabled), month: String(body.month || ""), combos };
       await this.state.storage.put("settings", this.settings);
       return new Response(JSON.stringify(this.settings), { headers: corsHeaders() });
     }
@@ -1373,13 +1375,13 @@ async function handleAdmin(request, env){
   }
 
   if(body.action === "setEventMode"){
-    const { enabled, month, modes } = body;
+    const { enabled, month, combos } = body;
     const eventId = env.EVENT_SETTINGS.idFromName("global");
     const eventStub = env.EVENT_SETTINGS.get(eventId);
     const res = await eventStub.fetch(new Request("https://internal/event", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "set", enabled, month, modes })
+      body: JSON.stringify({ action: "set", enabled, month, combos })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
@@ -1532,7 +1534,7 @@ export default {
 
       let eventEnabled = false;
       let eventMonth = "";
-      let eventModes = [];
+      let eventCombos = [];
       if(env.EVENT_SETTINGS){
         const eventId = env.EVENT_SETTINGS.idFromName("global");
         const eventStub = env.EVENT_SETTINGS.get(eventId);
@@ -1544,9 +1546,9 @@ export default {
         const eventData = await eventRes.json();
         eventEnabled = Boolean(eventData.enabled);
         eventMonth = String(eventData.month || "");
-        eventModes = Array.isArray(eventData.modes) ? eventData.modes : [];
+        eventCombos = Array.isArray(eventData.combos) ? eventData.combos : [];
       }
-      const eventActive = eventEnabled && eventMonth === getCurrentMonthJST() && eventModes.includes(mode);
+      const eventActive = eventEnabled && eventMonth === getCurrentMonthJST() && eventCombos.includes(`${mode}:${level}`);
 
       if(request.method === "GET"){
         if(force === "event"){
