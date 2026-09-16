@@ -1517,6 +1517,29 @@ export default {
       return handleAdmin(request, env);
     }
 
+    if(url.pathname === "/event-status"){
+      if(request.method === "OPTIONS"){
+        return new Response(null, { status: 204, headers: corsHeaders() });
+      }
+      if(!env.EVENT_SETTINGS){
+        return new Response(JSON.stringify({ enabled: false, month: "", combos: [] }), { headers: corsHeaders() });
+      }
+      const eventId = env.EVENT_SETTINGS.idFromName("global");
+      const eventStub = env.EVENT_SETTINGS.get(eventId);
+      const eventRes = await eventStub.fetch(new Request("https://internal/event", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "get" })
+      }));
+      const eventData = await eventRes.json();
+      const enabled = Boolean(eventData.enabled) && String(eventData.month || "") === getCurrentMonthJST();
+      return new Response(JSON.stringify({
+        enabled,
+        month: String(eventData.month || ""),
+        combos: enabled && Array.isArray(eventData.combos) ? eventData.combos : []
+      }), { headers: corsHeaders() });
+    }
+
     if(url.pathname === "/auth"){
       return handleAuth(request, env);
     }
