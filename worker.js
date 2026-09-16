@@ -592,7 +592,13 @@ export class Ranking {
       const score = Math.max(0, Math.round(Number(body.score) || 0));
       const name = sanitizeRankingName(body.name);
 
-      const activeEventMonth = eventEnabled && eventMonth === getCurrentMonthJST();
+      let activeEventMonth = eventEnabled && eventMonth === getCurrentMonthJST();
+      if(body.__forceNormal){
+        activeEventMonth = false;
+      } else if(body.__forceEvent){
+        activeEventMonth = true;
+        eventMonth = String(body.__eventMonth || eventMonth);
+      }
 
       if(activeEventMonth){
         const key = `monthScores:${eventMonth}`;
@@ -1510,24 +1516,45 @@ export default {
     if(url.pathname === "/ranking"){
       const mode = url.searchParams.get("mode") || "hiragana";
       const level = url.searchParams.get("level") || "beginner";
+      const force = url.searchParams.get("force") || "";
       const id = env.RANKING.idFromName(`${mode}:${level}`);
       const stub = env.RANKING.get(id);
+
+      let eventEnabled = false;
+      let eventMonth = "";
+      if(env.EVENT_SETTINGS){
+        const eventId = env.EVENT_SETTINGS.idFromName("global");
+        const eventStub = env.EVENT_SETTINGS.get(eventId);
+        const eventRes = await eventStub.fetch(new Request("https://internal/event", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "get" })
+        }));
+        const eventData = await eventRes.json();
+        eventEnabled = Boolean(eventData.enabled);
+        eventMonth = String(eventData.month || "");
+      }
+      const eventActive = eventEnabled && eventMonth === getCurrentMonthJST();
+
       if(request.method === "GET"){
-        let eventEnabled = false;
-        let eventMonth = "";
-        if(env.EVENT_SETTINGS){
-          const eventId = env.EVENT_SETTINGS.idFromName("global");
-          const eventStub = env.EVENT_SETTINGS.get(eventId);
-          const eventRes = await eventStub.fetch(new Request("https://internal/event", {
+        if(force === "event"){
+          if(!eventActive){
+            return new Response(JSON.stringify({ error: "no_event" }), { status: 409, headers: corsHeaders() });
+          }
+          const res = await stub.fetch(new Request("https://internal/ranking", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ action: "get" })
+            body: JSON.stringify({ action: "getMonthRanking", month: eventMonth })
           }));
-          const eventData = await eventRes.json();
-          eventEnabled = Boolean(eventData.enabled);
-          eventMonth = String(eventData.month || "");
+          const data = await res.json();
+          return new Response(JSON.stringify({ scores: data.top20 || [], eventMode: true, month: eventMonth }), { headers: corsHeaders() });
         }
-        if(eventEnabled && eventMonth === getCurrentMonthJST()){
+        if(force === "normal"){
+          const res = await stub.fetch(request);
+          const scores = await res.json();
+          return new Response(JSON.stringify({ scores, eventMode: false, month: "" }), { headers: corsHeaders() });
+        }
+        if(eventActive){
           const res = await stub.fetch(new Request("https://internal/ranking", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1540,6 +1567,27 @@ export default {
         const scores = await res.json();
         return new Response(JSON.stringify({ scores, eventMode: false, month: "" }), { headers: corsHeaders() });
       }
+
+      if(request.method === "POST" && (force === "event" || force === "normal")){
+        if(force === "event" && !eventActive){
+          return new Response(JSON.stringify({ error: "no_event" }), { status: 409, headers: corsHeaders() });
+        }
+        let body = {};
+        try{
+          body = await request.json();
+        }catch(e){
+          return new Response(JSON.stringify({ error: "invalid body" }), { status: 400, headers: corsHeaders() });
+        }
+        const forwardBody = force === "event"
+          ? { ...body, __forceEvent: true, __eventMonth: eventMonth }
+          : { ...body, __forceNormal: true };
+        return stub.fetch(new Request(request.url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(forwardBody)
+        }));
+      }
+
       return stub.fetch(request);
     }
 
