@@ -576,6 +576,7 @@ export class Ranking {
 
       let eventEnabled = false;
       let eventMonth = "";
+      let eventModes = [];
       if(this.env.EVENT_SETTINGS){
         const eventId = this.env.EVENT_SETTINGS.idFromName("global");
         const eventStub = this.env.EVENT_SETTINGS.get(eventId);
@@ -587,12 +588,13 @@ export class Ranking {
         const eventData = await eventRes.json();
         eventEnabled = Boolean(eventData.enabled);
         eventMonth = String(eventData.month || "");
+        eventModes = Array.isArray(eventData.modes) ? eventData.modes : [];
       }
 
       const score = Math.max(0, Math.round(Number(body.score) || 0));
       const name = sanitizeRankingName(body.name);
 
-      let activeEventMonth = eventEnabled && eventMonth === getCurrentMonthJST();
+      let activeEventMonth = eventEnabled && eventMonth === getCurrentMonthJST() && eventModes.includes(mode);
       if(body.__forceNormal){
         activeEventMonth = false;
       } else if(body.__forceEvent){
@@ -648,6 +650,8 @@ export class Ranking {
   }
 }
 
+const EVENT_MODES = ["hiragana", "katakana", "sentence"];
+
 export class EventSettings {
   constructor(state, env){
     this.state = state;
@@ -658,7 +662,10 @@ export class EventSettings {
   async load(){
     if(this.settings) return;
     const stored = await this.state.storage.get("settings");
-    this.settings = stored || { enabled: false, month: "" };
+    this.settings = stored || { enabled: false, month: "", modes: EVENT_MODES.slice() };
+    if(!Array.isArray(this.settings.modes)){
+      this.settings.modes = EVENT_MODES.slice();
+    }
   }
 
   async fetch(request){
@@ -680,7 +687,10 @@ export class EventSettings {
     }
 
     if(body.action === "set"){
-      this.settings = { enabled: Boolean(body.enabled), month: String(body.month || "") };
+      const modes = Array.isArray(body.modes)
+        ? body.modes.filter(m => EVENT_MODES.includes(m))
+        : EVENT_MODES.slice();
+      this.settings = { enabled: Boolean(body.enabled), month: String(body.month || ""), modes };
       await this.state.storage.put("settings", this.settings);
       return new Response(JSON.stringify(this.settings), { headers: corsHeaders() });
     }
@@ -1363,13 +1373,13 @@ async function handleAdmin(request, env){
   }
 
   if(body.action === "setEventMode"){
-    const { enabled, month } = body;
+    const { enabled, month, modes } = body;
     const eventId = env.EVENT_SETTINGS.idFromName("global");
     const eventStub = env.EVENT_SETTINGS.get(eventId);
     const res = await eventStub.fetch(new Request("https://internal/event", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "set", enabled, month })
+      body: JSON.stringify({ action: "set", enabled, month, modes })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
@@ -1522,6 +1532,7 @@ export default {
 
       let eventEnabled = false;
       let eventMonth = "";
+      let eventModes = [];
       if(env.EVENT_SETTINGS){
         const eventId = env.EVENT_SETTINGS.idFromName("global");
         const eventStub = env.EVENT_SETTINGS.get(eventId);
@@ -1533,8 +1544,9 @@ export default {
         const eventData = await eventRes.json();
         eventEnabled = Boolean(eventData.enabled);
         eventMonth = String(eventData.month || "");
+        eventModes = Array.isArray(eventData.modes) ? eventData.modes : [];
       }
-      const eventActive = eventEnabled && eventMonth === getCurrentMonthJST();
+      const eventActive = eventEnabled && eventMonth === getCurrentMonthJST() && eventModes.includes(mode);
 
       if(request.method === "GET"){
         if(force === "event"){
