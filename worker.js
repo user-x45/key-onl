@@ -954,6 +954,34 @@ async function verifyGoogleIdToken(idToken, expectedAudience){
   return payload;
 }
 
+async function verifyXAuthCode(code, codeVerifier, redirectUri, env){
+  const tokenRes = await fetch("https://api.x.com/2/oauth2/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Authorization": `Basic ${btoa(`${env.X_CLIENT_ID}:${env.X_CLIENT_SECRET}`)}`
+    },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: redirectUri,
+      code_verifier: codeVerifier,
+      client_id: env.X_CLIENT_ID
+    })
+  });
+  if(!tokenRes.ok) return null;
+  const tokenData = await tokenRes.json();
+  if(!tokenData.access_token) return null;
+
+  const userRes = await fetch("https://api.x.com/2/users/me", {
+    headers: { "Authorization": `Bearer ${tokenData.access_token}` }
+  });
+  if(!userRes.ok) return null;
+  const userData = await userRes.json();
+  if(!userData.data || !userData.data.id) return null;
+  return userData.data;
+}
+
 async function handleAuth(request, env){
   if(request.method === "OPTIONS"){
     return new Response(null, { status: 204, headers: corsHeaders() });
@@ -970,6 +998,19 @@ async function handleAuth(request, env){
   const authStub = env.USER_AUTH.get(authId);
 
   if(body.action === "login"){
+    if(body.provider === "x"){
+      const userData = await verifyXAuthCode(body.code, body.codeVerifier, body.redirectUri, env);
+      if(!userData){
+        return new Response(JSON.stringify({ error: "invalid auth code" }), { status: 401, headers: corsHeaders() });
+      }
+      const res = await authStub.fetch(new Request("https://internal/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "resolveLogin", sub: `x:${userData.id}` })
+      }));
+      return new Response(await res.text(), { headers: corsHeaders() });
+    }
+
     const payload = await verifyGoogleIdToken(body.idToken, env.GOOGLE_CLIENT_ID);
     if(!payload){
       return new Response(JSON.stringify({ error: "invalid id token" }), { status: 401, headers: corsHeaders() });
@@ -977,7 +1018,7 @@ async function handleAuth(request, env){
     const res = await authStub.fetch(new Request("https://internal/auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "resolveLogin", sub: payload.sub })
+      body: JSON.stringify({ action: "resolveLogin", sub: `google:${payload.sub}` })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
