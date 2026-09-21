@@ -750,6 +750,20 @@ export class UserAuth {
 
     if(body.action === "resolveLogin"){
       const { sub } = body;
+      if(sub && sub.startsWith("google:") && !this.users[sub]){
+        const legacySub = sub.slice("google:".length);
+        if(this.users[legacySub]){
+          this.users[sub] = this.users[legacySub];
+          delete this.users[legacySub];
+          for(const token of Object.keys(this.sessions)){
+            if(this.sessions[token].sub === legacySub){
+              this.sessions[token].sub = sub;
+            }
+          }
+          await this.state.storage.put("users", this.users);
+          await this.state.storage.put("sessions", this.sessions);
+        }
+      }
       const existing = this.users[sub];
       if(existing){
         const token = crypto.randomUUID();
