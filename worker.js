@@ -484,6 +484,26 @@ function getCurrentMonthJST(){
   return `${year}-${month}`;
 }
 
+function stripSubs(list){
+  return list.map(({ sub, ...rest }) => rest);
+}
+
+async function resolveUserSession(env, token){
+  if(!token || !env.USER_AUTH) return null;
+  const stub = env.USER_AUTH.get(env.USER_AUTH.idFromName("global"));
+  try{
+    const res = await stub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "resolveSession", token })
+    }));
+    const data = await res.json();
+    return data.valid ? data : null;
+  }catch(e){
+    return null;
+  }
+}
+
 function corsHeaders(){
   return {
     "Access-Control-Allow-Origin": "*",
@@ -551,7 +571,7 @@ export class Ranking {
         const month = String(body.month || "");
         const key = `monthScores:${month}`;
         const monthScores = (await this.state.storage.get(key)) || [];
-        return new Response(JSON.stringify({ top20: monthScores }), { headers: corsHeaders() });
+        return new Response(JSON.stringify({ top20: stripSubs(monthScores) }), { headers: corsHeaders() });
       }
 
       if(body.action === "clearMonthRanking"){
@@ -571,7 +591,7 @@ export class Ranking {
           monthScores.splice(idx, 1);
           await this.state.storage.put(key, monthScores);
         }
-        return new Response(JSON.stringify({ top20: monthScores }), { headers: corsHeaders() });
+        return new Response(JSON.stringify({ top20: stripSubs(monthScores) }), { headers: corsHeaders() });
       }
 
       let eventEnabled = false;
@@ -603,25 +623,27 @@ export class Ranking {
       }
 
       if(activeEventMonth){
+        const session = await resolveUserSession(this.env, body.token);
+        if(!session){
+          return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+        }
         const key = `monthScores:${eventMonth}`;
-        const monthScores = (await this.state.storage.get(key)) || [];
-        let monthRank = null;
-        const existingMonthIndex = monthScores.findIndex(s => s.score === score && s.name === name);
-        if(existingMonthIndex !== -1){
-          monthRank = existingMonthIndex < RANKING_MAX ? existingMonthIndex + 1 : null;
-        } else {
+        const stored = (await this.state.storage.get(key)) || [];
+        const currentIndex = stored.findIndex(s => s.sub === session.sub);
+        let monthScores = stored;
+        let monthRank = currentIndex !== -1 ? currentIndex + 1 : null;
+        if(currentIndex === -1 || score > stored[currentIndex].score){
+          const others = stored.filter(s => s.sub !== session.sub);
           let pos = 0;
-          while(pos < monthScores.length && monthScores[pos].score > score) pos++;
+          while(pos < others.length && others[pos].score > score) pos++;
           if(pos < RANKING_MAX){
-            monthScores.splice(pos, 0, { score, name });
-            if(monthScores.length > RANKING_MAX){
-              monthScores.length = RANKING_MAX;
-            }
+            others.splice(pos, 0, { score, name: session.name, sub: session.sub });
+            monthScores = others.slice(0, RANKING_MAX);
             monthRank = pos + 1;
             await this.state.storage.put(key, monthScores);
           }
         }
-        return new Response(JSON.stringify({ rank: monthRank, top20: monthScores, eventMode: true, month: eventMonth }), { headers: corsHeaders() });
+        return new Response(JSON.stringify({ rank: monthRank, top20: stripSubs(monthScores), eventMode: true, month: eventMonth }), { headers: corsHeaders() });
       }
 
       let rank = null;
@@ -792,6 +814,15 @@ export class UserAuth {
       await this.state.storage.put("pending", this.pending);
       await this.state.storage.put("sessions", this.sessions);
       return new Response(JSON.stringify({ token, name: cleanName }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "resolveSession"){
+      const entry = this.sessions[body.token];
+      const user = entry && entry.expires >= Date.now() ? this.users[entry.sub] : null;
+      if(!user){
+        return new Response(JSON.stringify({ valid: false }), { headers: corsHeaders() });
+      }
+      return new Response(JSON.stringify({ valid: true, sub: entry.sub, name: user.name }), { headers: corsHeaders() });
     }
 
     if(body.action === "verify"){
