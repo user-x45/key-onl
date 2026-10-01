@@ -1027,6 +1027,38 @@ async function verifyXAuthCode(code, codeVerifier, redirectUri, env){
   return userData.data;
 }
 
+async function verifyDiscordAuthCode(code, codeVerifier, redirectUri, env){
+  const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "User-Agent": "DiscordBot (https://s-typing.f5.si, 1.0)"
+    },
+    body: new URLSearchParams({
+      client_id: env.DISCORD_CLIENT_ID,
+      client_secret: env.DISCORD_CLIENT_SECRET,
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: redirectUri,
+      code_verifier: codeVerifier
+    })
+  });
+  if(!tokenRes.ok) return null;
+  const tokenData = await tokenRes.json();
+  if(!tokenData.access_token) return null;
+
+  const userRes = await fetch("https://discord.com/api/users/@me", {
+    headers: {
+      "Authorization": `Bearer ${tokenData.access_token}`,
+      "User-Agent": "DiscordBot (https://s-typing.f5.si, 1.0)"
+    }
+  });
+  if(!userRes.ok) return null;
+  const userData = await userRes.json();
+  if(!userData.id) return null;
+  return userData;
+}
+
 async function handleAuth(request, env){
   if(request.method === "OPTIONS"){
     return new Response(null, { status: 204, headers: corsHeaders() });
@@ -1052,6 +1084,19 @@ async function handleAuth(request, env){
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "resolveLogin", sub: `x:${userData.id}` })
+      }));
+      return new Response(await res.text(), { headers: corsHeaders() });
+    }
+
+    if(body.provider === "discord"){
+      const userData = await verifyDiscordAuthCode(body.code, body.codeVerifier, body.redirectUri, env);
+      if(!userData){
+        return new Response(JSON.stringify({ error: "invalid auth code" }), { status: 401, headers: corsHeaders() });
+      }
+      const res = await authStub.fetch(new Request("https://internal/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "resolveLogin", sub: `discord:${userData.id}` })
       }));
       return new Response(await res.text(), { headers: corsHeaders() });
     }
