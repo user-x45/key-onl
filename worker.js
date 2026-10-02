@@ -675,6 +675,7 @@ export class Ranking {
 const EVENT_MODES = ["hiragana", "katakana", "sentence"];
 const EVENT_LEVELS = ["beginner", "intermediate", "advanced"];
 const EVENT_COMBOS = EVENT_MODES.flatMap(mode => EVENT_LEVELS.map(level => `${mode}:${level}`));
+const EVENT_NOTICE_MAX = 200;
 
 export class EventSettings {
   constructor(state, env){
@@ -686,9 +687,12 @@ export class EventSettings {
   async load(){
     if(this.settings) return;
     const stored = await this.state.storage.get("settings");
-    this.settings = stored || { enabled: false, month: "", combos: EVENT_COMBOS.slice() };
+    this.settings = stored || { enabled: false, month: "", combos: EVENT_COMBOS.slice(), notice: "" };
     if(!Array.isArray(this.settings.combos)){
       this.settings.combos = EVENT_COMBOS.slice();
+    }
+    if(typeof this.settings.notice !== "string"){
+      this.settings.notice = "";
     }
   }
 
@@ -714,7 +718,8 @@ export class EventSettings {
       const combos = Array.isArray(body.combos)
         ? body.combos.filter(c => EVENT_COMBOS.includes(c))
         : EVENT_COMBOS.slice();
-      this.settings = { enabled: Boolean(body.enabled), month: String(body.month || ""), combos };
+      const notice = String(body.notice || "").trim().slice(0, EVENT_NOTICE_MAX);
+      this.settings = { enabled: Boolean(body.enabled), month: String(body.month || ""), combos, notice };
       await this.state.storage.put("settings", this.settings);
       return new Response(JSON.stringify(this.settings), { headers: corsHeaders() });
     }
@@ -1506,13 +1511,13 @@ async function handleAdmin(request, env){
   }
 
   if(body.action === "setEventMode"){
-    const { enabled, month, combos } = body;
+    const { enabled, month, combos, notice } = body;
     const eventId = env.EVENT_SETTINGS.idFromName("global");
     const eventStub = env.EVENT_SETTINGS.get(eventId);
     const res = await eventStub.fetch(new Request("https://internal/event", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "set", enabled, month, combos })
+      body: JSON.stringify({ action: "set", enabled, month, combos, notice })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
@@ -1653,7 +1658,7 @@ export default {
         return new Response(null, { status: 204, headers: corsHeaders() });
       }
       if(!env.EVENT_SETTINGS){
-        return new Response(JSON.stringify({ enabled: false, month: "", combos: [] }), { headers: corsHeaders() });
+        return new Response(JSON.stringify({ enabled: false, month: "", combos: [], notice: "" }), { headers: corsHeaders() });
       }
       const eventId = env.EVENT_SETTINGS.idFromName("global");
       const eventStub = env.EVENT_SETTINGS.get(eventId);
@@ -1667,7 +1672,8 @@ export default {
       return new Response(JSON.stringify({
         enabled,
         month: String(eventData.month || ""),
-        combos: enabled && Array.isArray(eventData.combos) ? eventData.combos : []
+        combos: enabled && Array.isArray(eventData.combos) ? eventData.combos : [],
+        notice: enabled ? String(eventData.notice || "") : ""
       }), { headers: corsHeaders() });
     }
 
