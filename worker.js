@@ -471,6 +471,80 @@ const RANKING_MAX = 20;
 const RANKING_MODES = ["hiragana", "katakana", "sentence"];
 const RANKING_LEVELS = ["beginner", "intermediate", "advanced"];
 
+const NAME_CHECK_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+const NAME_CHECK_CACHE_MAX = 500;
+const nameCheckCache = new Map();
+
+const NAME_CHECK_SYSTEM_PROMPT = [
+  "あなたはオンラインゲームのプレイヤー名を審査するモデレーターです。",
+  "与えられた名前が以下のいずれかに該当する場合は BLOCK、そうでなければ ALLOW と判定します。",
+  "1. 公序良俗に反する単語",
+  "2. 猥褻（下ネタ・性的な表現。隠語、伏せ字、当て字、ローマ字、英語、略語、ひらがな・カタカナ・漢字の言い換えを含む）",
+  "3. 暴力・残虐的表現（殺害、虐待、拷問、グロテスクな表現など）",
+  "4. 差別用語（人種、民族、国籍、宗教、性別、性的指向、障害、出身などに対する蔑称・侮辱）",
+  "5. 違法行為・犯罪を示唆する単語（違法薬物、自殺や自傷を促す言葉、テロ、犯罪の助長など）",
+  "名前は最大6文字です。文字の置き換え、全角半角の混在、記号や空白の挿入、逆読み、数字による当て字による回避も見抜いてください。",
+  "一般的な人名、ニックネーム、無害な単語、意味のない文字列は ALLOW としてください。",
+  "判定が難しい場合は、明らかに不適切と思われる場合のみ BLOCK としてください。",
+  '出力は {"verdict":"ALLOW"} または {"verdict":"BLOCK"} のJSONのみとし、他の文字は一切出力しないでください。'
+].join("\n");
+
+function normalizeNameForCheck(raw){
+  return String(raw || "").normalize("NFKC").trim().slice(0, 6);
+}
+
+function parseNameVerdict(result){
+  let text = "";
+  if(result && typeof result === "object"){
+    if(result.response && typeof result.response === "object"){
+      text = JSON.stringify(result.response);
+    } else {
+      text = String(result.response || "");
+    }
+  } else {
+    text = String(result || "");
+  }
+  const upper = text.toUpperCase();
+  if(upper.includes("BLOCK")) return false;
+  if(upper.includes("ALLOW")) return true;
+  return null;
+}
+
+async function checkNameAllowed(env, rawName){
+  const name = normalizeNameForCheck(rawName);
+  if(name.length === 0 || name === "GUEST") return { ok: true };
+  if(!env.AI) return { ok: false, error: "name_check_failed" };
+  if(nameCheckCache.has(name)){
+    return nameCheckCache.get(name) ? { ok: true } : { ok: false, error: "name_blocked" };
+  }
+  try{
+    const result = await env.AI.run(NAME_CHECK_MODEL, {
+      messages: [
+        { role: "system", content: NAME_CHECK_SYSTEM_PROMPT },
+        { role: "user", content: `プレイヤー名: ${JSON.stringify(name)}` }
+      ],
+      max_tokens: 20,
+      temperature: 0
+    });
+    const verdict = parseNameVerdict(result);
+    if(verdict === null) return { ok: false, error: "name_check_failed" };
+    if(nameCheckCache.size >= NAME_CHECK_CACHE_MAX){
+      nameCheckCache.delete(nameCheckCache.keys().next().value);
+    }
+    nameCheckCache.set(name, verdict);
+    return verdict ? { ok: true } : { ok: false, error: "name_blocked" };
+  }catch(e){
+    return { ok: false, error: "name_check_failed" };
+  }
+}
+
+async function rejectIfNameNotAllowed(env, rawName){
+  const check = await checkNameAllowed(env, rawName);
+  if(check.ok) return null;
+  const status = check.error === "name_blocked" ? 400 : 503;
+  return new Response(JSON.stringify({ error: check.error }), { status, headers: corsHeaders() });
+}
+
 function sanitizeRankingName(raw){
   const trimmed = String(raw || "").trim().slice(0, 6);
   return trimmed.length === 0 ? "GUEST" : trimmed;
@@ -1118,7 +1192,15 @@ async function handleAuth(request, env){
     return new Response(await res.text(), { headers: corsHeaders() });
   }
 
+  if(body.action === "checkName"){
+    const rejected = await rejectIfNameNotAllowed(env, body.name);
+    if(rejected) return rejected;
+    return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
+  }
+
   if(body.action === "register"){
+    const rejected = await rejectIfNameNotAllowed(env, body.name);
+    if(rejected) return rejected;
     const res = await authStub.fetch(new Request("https://internal/auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1155,6 +1237,8 @@ async function handleAuth(request, env){
   }
 
   if(body.action === "setName"){
+    const rejected = await rejectIfNameNotAllowed(env, body.name);
+    if(rejected) return rejected;
     const res = await authStub.fetch(new Request("https://internal/auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
