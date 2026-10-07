@@ -70,5 +70,8 @@ new_sqlite_classes = ["PlayLog"]
 tag = "v8"
 new_sqlite_classes = ["EventSettings"]
 
+[ai]
+binding = "AI"
+
 [vars]
 GOOGLE_CLIENT_ID = "7365893755-eqm3coij6otohorig4bgq4mtoen1q7sf.apps.googleusercontent.com"
