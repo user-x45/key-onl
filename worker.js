@@ -493,17 +493,29 @@ function normalizeNameForCheck(raw){
   return String(raw || "").normalize("NFKC").trim().slice(0, 6);
 }
 
-function parseNameVerdict(result){
-  let text = "";
-  if(result && typeof result === "object"){
-    if(result.response && typeof result.response === "object"){
-      text = JSON.stringify(result.response);
-    } else {
-      text = String(result.response || "");
+function extractModelText(result){
+  if(result === null || result === undefined) return "";
+  if(typeof result === "string") return result;
+  const choice = Array.isArray(result.choices) ? result.choices[0] : null;
+  if(choice){
+    if(choice.message && choice.message.content !== undefined && choice.message.content !== null){
+      const c = choice.message.content;
+      if(typeof c === "string") return c;
+      if(Array.isArray(c)) return c.map(part => (part && part.text) || "").join("");
+      return JSON.stringify(c);
     }
-  } else {
-    text = String(result || "");
+    if(typeof choice.text === "string") return choice.text;
   }
+  if(result.response !== undefined && result.response !== null){
+    return typeof result.response === "object" ? JSON.stringify(result.response) : String(result.response);
+  }
+  if(result.result) return extractModelText(result.result);
+  if(typeof result.output_text === "string") return result.output_text;
+  return "";
+}
+
+function parseNameVerdict(result){
+  const text = extractModelText(result);
   const upper = text.toUpperCase();
   if(upper.includes("BLOCK")) return false;
   if(upper.includes("ALLOW")) return true;
@@ -523,17 +535,21 @@ async function checkNameAllowed(env, rawName){
         { role: "system", content: NAME_CHECK_SYSTEM_PROMPT },
         { role: "user", content: `プレイヤー名: ${JSON.stringify(name)}` }
       ],
-      max_tokens: 20,
+      max_tokens: 512,
       temperature: 0
     });
     const verdict = parseNameVerdict(result);
-    if(verdict === null) return { ok: false, error: "name_check_failed" };
+    if(verdict === null){
+      console.error("name check unparsable", JSON.stringify(result).slice(0, 500));
+      return { ok: false, error: "name_check_failed" };
+    }
     if(nameCheckCache.size >= NAME_CHECK_CACHE_MAX){
       nameCheckCache.delete(nameCheckCache.keys().next().value);
     }
     nameCheckCache.set(name, verdict);
     return verdict ? { ok: true } : { ok: false, error: "name_blocked" };
   }catch(e){
+    console.error("name check error", e && e.message ? e.message : e);
     return { ok: false, error: "name_check_failed" };
   }
 }
