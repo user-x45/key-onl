@@ -535,8 +535,9 @@ async function checkNameAllowed(env, rawName){
         { role: "system", content: NAME_CHECK_SYSTEM_PROMPT },
         { role: "user", content: `プレイヤー名: ${JSON.stringify(name)}` }
       ],
-      max_tokens: 512,
-      temperature: 0
+      max_tokens: 128,
+      temperature: 0,
+      chat_template_kwargs: { enable_thinking: false }
     });
     const verdict = parseNameVerdict(result);
     if(verdict === null){
