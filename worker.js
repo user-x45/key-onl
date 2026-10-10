@@ -471,7 +471,7 @@ const RANKING_MAX = 20;
 const RANKING_MODES = ["hiragana", "katakana", "sentence"];
 const RANKING_LEVELS = ["beginner", "intermediate", "advanced"];
 
-const NAME_CHECK_MODEL = "@cf/google/gemma-3-12b-it";
+const NAME_CHECK_MODEL = "@cf/google/gemma-4-26b-a4b-it";
 const NAME_CHECK_CACHE_MAX = 500;
 const nameCheckCache = new Map();
 
