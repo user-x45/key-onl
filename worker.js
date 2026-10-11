@@ -1155,6 +1155,32 @@ async function verifyDiscordAuthCode(code, codeVerifier, redirectUri, env){
   return userData;
 }
 
+async function verifyLineAuthCode(code, codeVerifier, redirectUri, env){
+  const tokenRes = await fetch("https://api.line.me/oauth2/v2.1/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: redirectUri,
+      client_id: env.LINE_CHANNEL_ID,
+      client_secret: env.LINE_CHANNEL_SECRET,
+      code_verifier: codeVerifier
+    })
+  });
+  if(!tokenRes.ok) return null;
+  const tokenData = await tokenRes.json();
+  if(!tokenData.access_token) return null;
+
+  const profileRes = await fetch("https://api.line.me/v2/profile", {
+    headers: { "Authorization": `Bearer ${tokenData.access_token}` }
+  });
+  if(!profileRes.ok) return null;
+  const profile = await profileRes.json();
+  if(!profile.userId) return null;
+  return profile;
+}
+
 async function handleAuth(request, env){
   if(request.method === "OPTIONS"){
     return new Response(null, { status: 204, headers: corsHeaders() });
@@ -1193,6 +1219,19 @@ async function handleAuth(request, env){
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "resolveLogin", sub: `discord:${userData.id}` })
+      }));
+      return new Response(await res.text(), { headers: corsHeaders() });
+    }
+
+    if(body.provider === "line"){
+      const userData = await verifyLineAuthCode(body.code, body.codeVerifier, body.redirectUri, env);
+      if(!userData){
+        return new Response(JSON.stringify({ error: "invalid auth code" }), { status: 401, headers: corsHeaders() });
+      }
+      const res = await authStub.fetch(new Request("https://internal/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "resolveLogin", sub: `line:${userData.userId}` })
       }));
       return new Response(await res.text(), { headers: corsHeaders() });
     }
