@@ -1181,6 +1181,58 @@ async function verifyLineAuthCode(code, codeVerifier, redirectUri, env){
   return profile;
 }
 
+async function verifyFacebookAuthCode(code, redirectUri, env){
+  const tokenQuery = new URLSearchParams({
+    client_id: env.FACEBOOK_APP_ID,
+    client_secret: env.FACEBOOK_APP_SECRET,
+    redirect_uri: redirectUri,
+    code
+  });
+  const tokenRes = await fetch(`https://graph.facebook.com/v22.0/oauth/access_token?${tokenQuery.toString()}`);
+  if(!tokenRes.ok) return null;
+  const tokenData = await tokenRes.json();
+  if(!tokenData.access_token) return null;
+
+  const userRes = await fetch("https://graph.facebook.com/v22.0/me?fields=id", {
+    headers: { "Authorization": `Bearer ${tokenData.access_token}` }
+  });
+  if(!userRes.ok) return null;
+  const userData = await userRes.json();
+  if(!userData.id) return null;
+  return userData;
+}
+
+async function verifyGithubAuthCode(code, redirectUri, env){
+  const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Accept": "application/json"
+    },
+    body: new URLSearchParams({
+      client_id: env.GITHUB_CLIENT_ID,
+      client_secret: env.GITHUB_CLIENT_SECRET,
+      code,
+      redirect_uri: redirectUri
+    })
+  });
+  if(!tokenRes.ok) return null;
+  const tokenData = await tokenRes.json();
+  if(!tokenData.access_token) return null;
+
+  const userRes = await fetch("https://api.github.com/user", {
+    headers: {
+      "Authorization": `Bearer ${tokenData.access_token}`,
+      "Accept": "application/vnd.github+json",
+      "User-Agent": "s-typing"
+    }
+  });
+  if(!userRes.ok) return null;
+  const userData = await userRes.json();
+  if(!userData.id) return null;
+  return userData;
+}
+
 async function handleAuth(request, env){
   if(request.method === "OPTIONS"){
     return new Response(null, { status: 204, headers: corsHeaders() });
@@ -1232,6 +1284,32 @@ async function handleAuth(request, env){
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "resolveLogin", sub: `line:${userData.userId}` })
+      }));
+      return new Response(await res.text(), { headers: corsHeaders() });
+    }
+
+    if(body.provider === "facebook"){
+      const userData = await verifyFacebookAuthCode(body.code, body.redirectUri, env);
+      if(!userData){
+        return new Response(JSON.stringify({ error: "invalid auth code" }), { status: 401, headers: corsHeaders() });
+      }
+      const res = await authStub.fetch(new Request("https://internal/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "resolveLogin", sub: `facebook:${userData.id}` })
+      }));
+      return new Response(await res.text(), { headers: corsHeaders() });
+    }
+
+    if(body.provider === "github"){
+      const userData = await verifyGithubAuthCode(body.code, body.redirectUri, env);
+      if(!userData){
+        return new Response(JSON.stringify({ error: "invalid auth code" }), { status: 401, headers: corsHeaders() });
+      }
+      const res = await authStub.fetch(new Request("https://internal/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "resolveLogin", sub: `github:${userData.id}` })
       }));
       return new Response(await res.text(), { headers: corsHeaders() });
     }
