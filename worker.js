@@ -824,131 +824,6 @@ const PENDING_TOKEN_TTL_MS = 10 * 60 * 1000;
 
 const PLAY_RECORD_MAX = 20;
 
-const PASSKEY_CHALLENGE_TTL_MS = 5 * 60 * 1000;
-const PASSKEY_CHALLENGE_MAX = 1000;
-const PASSKEY_DEFAULT_RP_ID = "s-typing.f5.si";
-const PASSKEY_ALGS = [-7, -257];
-
-function passkeyRpId(env){
-  return env.PASSKEY_RP_ID || PASSKEY_DEFAULT_RP_ID;
-}
-
-function passkeyOrigin(env){
-  return env.PASSKEY_ORIGIN || `https://${passkeyRpId(env)}`;
-}
-
-function bytesToB64url(bytes){
-  let binary = "";
-  for(let i = 0; i < bytes.length; i++){
-    binary += String.fromCharCode(bytes[i]);
-  }
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function b64urlToBytes(str){
-  const base64 = String(str).replace(/-/g, "+").replace(/_/g, "/");
-  const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
-  const binary = atob(padded);
-  const bytes = new Uint8Array(binary.length);
-  for(let i = 0; i < binary.length; i++){
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
-function randomB64url(length){
-  const bytes = new Uint8Array(length);
-  crypto.getRandomValues(bytes);
-  return bytesToB64url(bytes);
-}
-
-function concatBytes(a, b){
-  const out = new Uint8Array(a.length + b.length);
-  out.set(a, 0);
-  out.set(b, a.length);
-  return out;
-}
-
-function derSignatureToRaw(der, size){
-  let offset = 2;
-  if(der[1] & 0x80) offset += der[1] & 0x7f;
-  const readInt = () => {
-    if(der[offset] !== 0x02) throw new Error("bad der");
-    const len = der[offset + 1];
-    let value = der.slice(offset + 2, offset + 2 + len);
-    offset += 2 + len;
-    while(value.length > size && value[0] === 0) value = value.slice(1);
-    if(value.length > size) throw new Error("bad der");
-    const padded = new Uint8Array(size);
-    padded.set(value, size - value.length);
-    return padded;
-  };
-  const r = readInt();
-  const s = readInt();
-  return concatBytes(r, s);
-}
-
-async function importPasskeyPublicKey(spkiB64url, alg){
-  const spki = b64urlToBytes(spkiB64url);
-  if(alg === -7){
-    return crypto.subtle.importKey("spki", spki, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
-  }
-  if(alg === -257){
-    return crypto.subtle.importKey("spki", spki, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
-  }
-  throw new Error("unsupported alg");
-}
-
-async function verifyPasskeySignature(credential, signature, signedData){
-  const key = await importPasskeyPublicKey(credential.publicKey, credential.alg);
-  if(credential.alg === -7){
-    return crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, derSignatureToRaw(signature, 32), signedData);
-  }
-  return crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, signature, signedData);
-}
-
-function parsePasskeyClientData(clientDataB64, expectedType, expectedChallenge, env){
-  let bytes;
-  let data;
-  try{
-    bytes = b64urlToBytes(clientDataB64);
-    data = JSON.parse(new TextDecoder().decode(bytes));
-  }catch(e){
-    return null;
-  }
-  if(!data || data.type !== expectedType) return null;
-  if(data.challenge !== expectedChallenge) return null;
-  if(data.origin !== passkeyOrigin(env)) return null;
-  if(data.crossOrigin === true) return null;
-  return bytes;
-}
-
-async function parsePasskeyAuthData(authDataB64, env){
-  let bytes;
-  try{
-    bytes = b64urlToBytes(authDataB64);
-  }catch(e){
-    return null;
-  }
-  if(bytes.length < 37) return null;
-  const expectedHash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(passkeyRpId(env))));
-  for(let i = 0; i < 32; i++){
-    if(bytes[i] !== expectedHash[i]) return null;
-  }
-  const flags = bytes[32];
-  if(!(flags & 0x01)) return null;
-  const counter = ((bytes[33] << 24) | (bytes[34] << 16) | (bytes[35] << 8) | bytes[36]) >>> 0;
-  return { bytes, flags, counter };
-}
-
-function passkeyErrorResponse(message, status){
-  return new Response(JSON.stringify({ error: message }), { status: status || 400, headers: corsHeaders() });
-}
-
-function hasOwn(obj, key){
-  return typeof key === "string" && Object.prototype.hasOwnProperty.call(obj, key);
-}
-
 export class UserAuth {
   constructor(state, env){
     this.state = state;
@@ -956,18 +831,14 @@ export class UserAuth {
     this.users = null;
     this.sessions = null;
     this.pending = null;
-    this.challenges = null;
-    this.passkeys = null;
   }
 
   async load(){
-    if(this.users && this.sessions && this.pending && this.challenges && this.passkeys) return;
-    const stored = await this.state.storage.get(["users", "sessions", "pending", "challenges", "passkeys"]);
+    if(this.users && this.sessions && this.pending) return;
+    const stored = await this.state.storage.get(["users", "sessions", "pending"]);
     this.users = stored.get("users") || {};
     this.sessions = stored.get("sessions") || {};
     this.pending = stored.get("pending") || {};
-    this.challenges = stored.get("challenges") || {};
-    this.passkeys = stored.get("passkeys") || {};
   }
 
   pruneExpired(){
@@ -978,140 +849,6 @@ export class UserAuth {
     for(const token of Object.keys(this.pending)){
       if(this.pending[token].expires < now) delete this.pending[token];
     }
-    for(const id of Object.keys(this.challenges)){
-      if(this.challenges[id].expires < now) delete this.challenges[id];
-    }
-  }
-
-  async resolveLogin(sub){
-    if(sub && sub.startsWith("google:") && !this.users[sub]){
-      const legacySub = sub.slice("google:".length);
-      if(this.users[legacySub]){
-        this.users[sub] = this.users[legacySub];
-        delete this.users[legacySub];
-        for(const token of Object.keys(this.sessions)){
-          if(this.sessions[token].sub === legacySub){
-            this.sessions[token].sub = sub;
-          }
-        }
-        await this.state.storage.put("users", this.users);
-        await this.state.storage.put("sessions", this.sessions);
-      }
-    }
-    const existing = this.users[sub];
-    if(existing){
-      const token = crypto.randomUUID();
-      this.sessions[token] = { sub, expires: Date.now() + LOGIN_SESSION_TTL_MS };
-      await this.state.storage.put("sessions", this.sessions);
-      return new Response(JSON.stringify({ isNewUser: false, token, name: existing.name, inputMode: existing.inputMode || null, displaySettings: existing.displaySettings || null }), { headers: corsHeaders() });
-    }
-    const pendingToken = crypto.randomUUID();
-    this.pending[pendingToken] = { sub, expires: Date.now() + PENDING_TOKEN_TTL_MS };
-    await this.state.storage.put("pending", this.pending);
-    return new Response(JSON.stringify({ isNewUser: true, pendingToken }), { headers: corsHeaders() });
-  }
-
-  async consumeChallenge(challengeId, type){
-    if(!hasOwn(this.challenges, challengeId)) return null;
-    const entry = this.challenges[challengeId];
-    delete this.challenges[challengeId];
-    await this.state.storage.put("challenges", this.challenges);
-    if(entry.type !== type || entry.expires < Date.now()) return null;
-    return entry;
-  }
-
-  async passkeyOptions(type){
-    if(type !== "register" && type !== "login"){
-      return passkeyErrorResponse("invalid type");
-    }
-    const challenge = randomB64url(32);
-    const challengeId = crypto.randomUUID();
-    const entry = { type, challenge, expires: Date.now() + PASSKEY_CHALLENGE_TTL_MS };
-    const rpId = passkeyRpId(this.env);
-    let options;
-    if(type === "register"){
-      const userHandle = randomB64url(16);
-      entry.userHandle = userHandle;
-      options = {
-        rp: { name: "シンプルタイピング", id: rpId },
-        user: { id: userHandle, name: `player-${userHandle.slice(0, 6)}`, displayName: "シンプルタイピング" },
-        challenge,
-        pubKeyCredParams: PASSKEY_ALGS.map(alg => ({ type: "public-key", alg })),
-        authenticatorSelection: { residentKey: "required", requireResidentKey: true, userVerification: "preferred" },
-        attestation: "none",
-        timeout: 60000
-      };
-    } else {
-      options = { challenge, rpId, userVerification: "preferred", timeout: 60000 };
-    }
-    this.challenges[challengeId] = entry;
-    const ids = Object.keys(this.challenges);
-    for(let i = 0; i < ids.length - PASSKEY_CHALLENGE_MAX; i++){
-      delete this.challenges[ids[i]];
-    }
-    await this.state.storage.put("challenges", this.challenges);
-    return new Response(JSON.stringify({ challengeId, options }), { headers: corsHeaders() });
-  }
-
-  async passkeyRegister(body){
-    const entry = await this.consumeChallenge(body.challengeId, "register");
-    if(!entry) return passkeyErrorResponse("invalid challenge", 401);
-    const c = body.credential || {};
-    if(typeof c.id !== "string" || !parsePasskeyClientData(c.clientDataJSON, "webauthn.create", entry.challenge, this.env)){
-      return passkeyErrorResponse("invalid credential", 401);
-    }
-    const auth = await parsePasskeyAuthData(c.authenticatorData, this.env);
-    if(!auth || !(auth.flags & 0x40) || auth.bytes.length < 55){
-      return passkeyErrorResponse("invalid credential", 401);
-    }
-    const idLength = (auth.bytes[53] << 8) | auth.bytes[54];
-    const credIdBytes = auth.bytes.slice(55, 55 + idLength);
-    const credentialId = bytesToB64url(credIdBytes);
-    if(idLength === 0 || credentialId !== c.id){
-      return passkeyErrorResponse("invalid credential", 401);
-    }
-    const alg = Number(c.publicKeyAlgorithm);
-    if(!PASSKEY_ALGS.includes(alg) || typeof c.publicKey !== "string"){
-      return passkeyErrorResponse("unsupported algorithm", 400);
-    }
-    try{
-      await importPasskeyPublicKey(c.publicKey, alg);
-    }catch(e){
-      return passkeyErrorResponse("invalid public key", 400);
-    }
-    if(hasOwn(this.passkeys, credentialId)){
-      return passkeyErrorResponse("already registered", 409);
-    }
-    const sub = `passkey:${entry.userHandle}`;
-    this.passkeys[credentialId] = { sub, publicKey: c.publicKey, alg, counter: auth.counter, createdAt: Date.now() };
-    await this.state.storage.put("passkeys", this.passkeys);
-    return this.resolveLogin(sub);
-  }
-
-  async passkeyLogin(body){
-    const entry = await this.consumeChallenge(body.challengeId, "login");
-    if(!entry) return passkeyErrorResponse("invalid challenge", 401);
-    const c = body.credential || {};
-    if(!hasOwn(this.passkeys, c.id)) return passkeyErrorResponse("unknown credential", 401);
-    const stored = this.passkeys[c.id];
-    const clientBytes = parsePasskeyClientData(c.clientDataJSON, "webauthn.get", entry.challenge, this.env);
-    if(!clientBytes) return passkeyErrorResponse("invalid credential", 401);
-    const auth = await parsePasskeyAuthData(c.authenticatorData, this.env);
-    if(!auth) return passkeyErrorResponse("invalid credential", 401);
-    let valid = false;
-    try{
-      const clientHash = new Uint8Array(await crypto.subtle.digest("SHA-256", clientBytes));
-      valid = await verifyPasskeySignature(stored, b64urlToBytes(c.signature), concatBytes(auth.bytes, clientHash));
-    }catch(e){
-      valid = false;
-    }
-    if(!valid) return passkeyErrorResponse("invalid signature", 401);
-    if((auth.counter !== 0 || stored.counter !== 0) && auth.counter <= stored.counter){
-      return passkeyErrorResponse("invalid counter", 401);
-    }
-    stored.counter = auth.counter;
-    await this.state.storage.put("passkeys", this.passkeys);
-    return this.resolveLogin(stored.sub);
   }
 
   async fetch(request){
@@ -1130,19 +867,32 @@ export class UserAuth {
     }
 
     if(body.action === "resolveLogin"){
-      return this.resolveLogin(body.sub);
-    }
-
-    if(body.action === "passkeyOptions"){
-      return this.passkeyOptions(body.type);
-    }
-
-    if(body.action === "passkeyRegister"){
-      return this.passkeyRegister(body);
-    }
-
-    if(body.action === "passkeyLogin"){
-      return this.passkeyLogin(body);
+      const { sub } = body;
+      if(sub && sub.startsWith("google:") && !this.users[sub]){
+        const legacySub = sub.slice("google:".length);
+        if(this.users[legacySub]){
+          this.users[sub] = this.users[legacySub];
+          delete this.users[legacySub];
+          for(const token of Object.keys(this.sessions)){
+            if(this.sessions[token].sub === legacySub){
+              this.sessions[token].sub = sub;
+            }
+          }
+          await this.state.storage.put("users", this.users);
+          await this.state.storage.put("sessions", this.sessions);
+        }
+      }
+      const existing = this.users[sub];
+      if(existing){
+        const token = crypto.randomUUID();
+        this.sessions[token] = { sub, expires: Date.now() + LOGIN_SESSION_TTL_MS };
+        await this.state.storage.put("sessions", this.sessions);
+        return new Response(JSON.stringify({ isNewUser: false, token, name: existing.name, inputMode: existing.inputMode || null, displaySettings: existing.displaySettings || null }), { headers: corsHeaders() });
+      }
+      const pendingToken = crypto.randomUUID();
+      this.pending[pendingToken] = { sub, expires: Date.now() + PENDING_TOKEN_TTL_MS };
+      await this.state.storage.put("pending", this.pending);
+      return new Response(JSON.stringify({ isNewUser: true, pendingToken }), { headers: corsHeaders() });
     }
 
     if(body.action === "register"){
@@ -1326,12 +1076,8 @@ export class UserAuth {
       for(const token of Object.keys(this.sessions)){
         if(this.sessions[token].sub === sub) delete this.sessions[token];
       }
-      for(const id of Object.keys(this.passkeys)){
-        if(this.passkeys[id].sub === sub) delete this.passkeys[id];
-      }
       await this.state.storage.put("users", this.users);
       await this.state.storage.put("sessions", this.sessions);
-      await this.state.storage.put("passkeys", this.passkeys);
       return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
     }
 
@@ -1502,29 +1248,7 @@ async function handleAuth(request, env){
   const authId = env.USER_AUTH.idFromName("global");
   const authStub = env.USER_AUTH.get(authId);
 
-  if(body.action === "passkeyOptions"){
-    const res = await authStub.fetch(new Request("https://internal/auth", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "passkeyOptions", type: body.type })
-    }));
-    return new Response(await res.text(), { status: res.status, headers: corsHeaders() });
-  }
-
   if(body.action === "login"){
-    if(body.provider === "passkey"){
-      const res = await authStub.fetch(new Request("https://internal/auth", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: body.passkeyType === "register" ? "passkeyRegister" : "passkeyLogin",
-          challengeId: body.challengeId,
-          credential: body.credential
-        })
-      }));
-      return new Response(await res.text(), { status: res.status, headers: corsHeaders() });
-    }
-
     if(body.provider === "x"){
       const userData = await verifyXAuthCode(body.code, body.codeVerifier, body.redirectUri, env);
       if(!userData){
