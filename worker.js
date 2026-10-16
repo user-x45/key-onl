@@ -722,7 +722,7 @@ export class Ranking {
         const stored = (await this.state.storage.get(key)) || [];
         const currentIndex = stored.findIndex(s => s.sub === session.sub);
         let monthScores = stored;
-        let monthRank = currentIndex !== -1 ? currentIndex + 1 : null;
+        let monthRank = null;
         if(currentIndex === -1 || score > stored[currentIndex].score){
           const others = stored.filter(s => s.sub !== session.sub);
           let pos = 0;
