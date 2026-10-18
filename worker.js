@@ -1514,6 +1514,209 @@ const ADMIN_TOKEN_TTL_MS = 30 * 60 * 1000;
 const ADMIN_MAX_ATTEMPTS = 5;
 const ADMIN_ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
 const ADMIN_LOCK_MS = 15 * 60 * 1000;
+const ADMIN_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+const ADMIN_MAX_CHALLENGES = 50;
+const ADMIN_MAX_CREDENTIALS = 10;
+
+function b64urlEncode(bytes){
+  const arr = new Uint8Array(bytes);
+  let bin = "";
+  for(let i = 0; i < arr.length; i++){
+    bin += String.fromCharCode(arr[i]);
+  }
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function b64urlDecode(str){
+  const s = String(str).replace(/-/g, "+").replace(/_/g, "/");
+  const padded = s + "=".repeat((4 - (s.length % 4)) % 4);
+  const bin = atob(padded);
+  const out = new Uint8Array(bin.length);
+  for(let i = 0; i < bin.length; i++){
+    out[i] = bin.charCodeAt(i);
+  }
+  return out;
+}
+
+function concatBytes(...arrays){
+  const total = arrays.reduce((n, a) => n + a.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for(const a of arrays){
+    out.set(a, offset);
+    offset += a.length;
+  }
+  return out;
+}
+
+async function sha256(data){
+  return new Uint8Array(await crypto.subtle.digest("SHA-256", data));
+}
+
+function bytesEqual(a, b){
+  if(a.length !== b.length) return false;
+  let diff = 0;
+  for(let i = 0; i < a.length; i++){
+    diff |= a[i] ^ b[i];
+  }
+  return diff === 0;
+}
+
+async function secretEquals(a, b){
+  const ha = await sha256(new TextEncoder().encode(String(a || "")));
+  const hb = await sha256(new TextEncoder().encode(String(b || "")));
+  return bytesEqual(ha, hb);
+}
+
+function cborDecode(bytes, start){
+  let pos = start || 0;
+
+  function readLen(info){
+    if(info < 24) return info;
+    if(info === 24){
+      const v = bytes[pos];
+      pos += 1;
+      return v;
+    }
+    if(info === 25){
+      const v = (bytes[pos] << 8) | bytes[pos + 1];
+      pos += 2;
+      return v;
+    }
+    if(info === 26){
+      const v = bytes[pos] * 16777216 + (bytes[pos + 1] << 16) + (bytes[pos + 2] << 8) + bytes[pos + 3];
+      pos += 4;
+      return v;
+    }
+    throw new Error("unsupported cbor length");
+  }
+
+  function read(){
+    const initial = bytes[pos];
+    pos += 1;
+    const major = initial >> 5;
+    const info = initial & 31;
+    if(major === 0) return readLen(info);
+    if(major === 1) return -1 - readLen(info);
+    if(major === 2){
+      const len = readLen(info);
+      const v = bytes.slice(pos, pos + len);
+      pos += len;
+      return v;
+    }
+    if(major === 3){
+      const len = readLen(info);
+      const v = new TextDecoder().decode(bytes.slice(pos, pos + len));
+      pos += len;
+      return v;
+    }
+    if(major === 4){
+      const len = readLen(info);
+      const arr = [];
+      for(let i = 0; i < len; i++){
+        arr.push(read());
+      }
+      return arr;
+    }
+    if(major === 5){
+      const len = readLen(info);
+      const map = new Map();
+      for(let i = 0; i < len; i++){
+        const k = read();
+        const v = read();
+        map.set(k, v);
+      }
+      return map;
+    }
+    if(major === 7){
+      if(info === 20) return false;
+      if(info === 21) return true;
+      if(info === 22) return null;
+    }
+    throw new Error("unsupported cbor type");
+  }
+
+  const value = read();
+  return { value, end: pos };
+}
+
+function coseToCredentialKey(cose){
+  if(!(cose instanceof Map)) return null;
+  const kty = cose.get(1);
+  const alg = cose.get(3);
+  if(kty === 2 && alg === -7 && cose.get(-1) === 1){
+    const x = cose.get(-2);
+    const y = cose.get(-3);
+    if(!(x instanceof Uint8Array) || !(y instanceof Uint8Array) || x.length !== 32 || y.length !== 32) return null;
+    return { alg: -7, jwk: { kty: "EC", crv: "P-256", x: b64urlEncode(x), y: b64urlEncode(y), ext: true } };
+  }
+  if(kty === 3 && alg === -257){
+    const n = cose.get(-1);
+    const e = cose.get(-2);
+    if(!(n instanceof Uint8Array) || !(e instanceof Uint8Array)) return null;
+    return { alg: -257, jwk: { kty: "RSA", alg: "RS256", n: b64urlEncode(n), e: b64urlEncode(e), ext: true } };
+  }
+  return null;
+}
+
+function derToRawEcdsa(der){
+  let pos = 0;
+  if(der[pos++] !== 0x30) throw new Error("bad signature");
+  let seqLen = der[pos++];
+  if(seqLen & 0x80){
+    const n = seqLen & 0x7f;
+    seqLen = 0;
+    for(let i = 0; i < n; i++){
+      seqLen = (seqLen << 8) | der[pos++];
+    }
+  }
+  function readInt(){
+    if(der[pos++] !== 0x02) throw new Error("bad signature");
+    const len = der[pos++];
+    let int = der.slice(pos, pos + len);
+    pos += len;
+    while(int.length > 32 && int[0] === 0){
+      int = int.slice(1);
+    }
+    if(int.length > 32) throw new Error("bad signature");
+    const out = new Uint8Array(32);
+    out.set(int, 32 - int.length);
+    return out;
+  }
+  const r = readInt();
+  const s = readInt();
+  return concatBytes(r, s);
+}
+
+function parseAuthData(authData){
+  if(authData.length < 37) throw new Error("bad authenticator data");
+  return {
+    rpIdHash: authData.slice(0, 32),
+    flags: authData[32],
+    signCount: ((authData[33] << 24) | (authData[34] << 16) | (authData[35] << 8) | authData[36]) >>> 0
+  };
+}
+
+function parseClientData(clientDataBytes, expectedType, env){
+  const clientData = JSON.parse(new TextDecoder().decode(clientDataBytes));
+  if(clientData.type !== expectedType) return null;
+  if(clientData.origin !== env.ADMIN_ORIGIN) return null;
+  if(clientData.crossOrigin === true) return null;
+  if(typeof clientData.challenge !== "string") return null;
+  return clientData;
+}
+
+async function verifyAssertionSignature(credential, signedData, signature){
+  if(credential.alg === -7){
+    const key = await crypto.subtle.importKey("jwk", credential.jwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    return crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, derToRawEcdsa(signature), signedData);
+  }
+  if(credential.alg === -257){
+    const key = await crypto.subtle.importKey("jwk", credential.jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
+    return crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, signature, signedData);
+  }
+  return false;
+}
 
 export class AdminAuth {
   constructor(state, env){
@@ -1521,13 +1724,17 @@ export class AdminAuth {
     this.env = env;
     this.tokens = null;
     this.attempts = null;
+    this.credentials = null;
+    this.challenges = null;
   }
 
   async load(){
-    if(this.tokens && this.attempts) return;
-    const stored = await this.state.storage.get(["tokens", "attempts"]);
+    if(this.tokens && this.attempts && this.credentials && this.challenges) return;
+    const stored = await this.state.storage.get(["tokens", "attempts", "credentials", "challenges"]);
     this.tokens = stored.get("tokens") || {};
     this.attempts = stored.get("attempts") || {};
+    this.credentials = stored.get("credentials") || {};
+    this.challenges = stored.get("challenges") || {};
   }
 
   pruneExpired(){
@@ -1535,6 +1742,11 @@ export class AdminAuth {
     for(const token of Object.keys(this.tokens)){
       if(this.tokens[token] < now){
         delete this.tokens[token];
+      }
+    }
+    for(const challenge of Object.keys(this.challenges)){
+      if(this.challenges[challenge] < now){
+        delete this.challenges[challenge];
       }
     }
     for(const ip of Object.keys(this.attempts)){
@@ -1608,8 +1820,212 @@ export class AdminAuth {
       return new Response(JSON.stringify({ valid }), { headers: corsHeaders() });
     }
 
+    if(body.action === "listCredentialIds"){
+      return new Response(JSON.stringify({ ids: Object.keys(this.credentials) }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "getCredential"){
+      const credential = typeof body.id === "string" ? this.credentials[body.id] || null : null;
+      return new Response(JSON.stringify({ credential }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "saveCredential"){
+      const credential = body.credential;
+      if(!credential || typeof credential.id !== "string"){
+        return new Response(JSON.stringify({ error: "invalid credential" }), { status: 400, headers: corsHeaders() });
+      }
+      if(!this.credentials[credential.id] && Object.keys(this.credentials).length >= ADMIN_MAX_CREDENTIALS){
+        return new Response(JSON.stringify({ error: "too many credentials" }), { status: 400, headers: corsHeaders() });
+      }
+      this.credentials[credential.id] = credential;
+      await this.state.storage.put("credentials", this.credentials);
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "updateSignCount"){
+      if(this.credentials[body.id]){
+        this.credentials[body.id].signCount = body.signCount;
+        await this.state.storage.put("credentials", this.credentials);
+      }
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "newChallenge"){
+      const challenge = b64urlEncode(crypto.getRandomValues(new Uint8Array(32)));
+      this.challenges[challenge] = Date.now() + ADMIN_CHALLENGE_TTL_MS;
+      const keys = Object.keys(this.challenges);
+      if(keys.length > ADMIN_MAX_CHALLENGES){
+        keys.sort((a, b) => this.challenges[a] - this.challenges[b]);
+        for(const key of keys.slice(0, keys.length - ADMIN_MAX_CHALLENGES)){
+          delete this.challenges[key];
+        }
+      }
+      await this.state.storage.put("challenges", this.challenges);
+      return new Response(JSON.stringify({ challenge }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "takeChallenge"){
+      const valid = Boolean(body.challenge && this.challenges[body.challenge] && this.challenges[body.challenge] >= Date.now());
+      if(valid){
+        delete this.challenges[body.challenge];
+        await this.state.storage.put("challenges", this.challenges);
+      }
+      return new Response(JSON.stringify({ valid }), { headers: corsHeaders() });
+    }
+
     return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
   }
+}
+
+async function adminAuthCall(stub, payload){
+  const res = await stub.fetch(new Request("https://internal/auth", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  }));
+  return res.json();
+}
+
+function adminJson(data, status){
+  return new Response(JSON.stringify(data), { status: status || 200, headers: corsHeaders() });
+}
+
+async function handlePasskeyAdmin(body, request, env, authStub){
+  const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+
+  if(!env.ADMIN_RP_ID || !env.ADMIN_ORIGIN){
+    return adminJson({ error: "passkey_not_configured" }, 500);
+  }
+
+  async function lockedResponse(){
+    const lock = await adminAuthCall(authStub, { action: "checkLock", ip });
+    if(lock.locked){
+      return adminJson({ error: "locked", retryAfterSeconds: lock.retryAfterSeconds }, 429);
+    }
+    return null;
+  }
+
+  async function fail(){
+    await adminAuthCall(authStub, { action: "recordFailure", ip });
+    return adminJson({ error: "unauthorized" }, 401);
+  }
+
+  if(body.action === "authOptions"){
+    const locked = await lockedResponse();
+    if(locked) return locked;
+    const list = await adminAuthCall(authStub, { action: "listCredentialIds" });
+    if(list.ids.length === 0){
+      return adminJson({ hasCredentials: false });
+    }
+    const issued = await adminAuthCall(authStub, { action: "newChallenge" });
+    return adminJson({ hasCredentials: true, challenge: issued.challenge, rpId: env.ADMIN_RP_ID, allowCredentials: list.ids });
+  }
+
+  if(body.action === "login"){
+    const locked = await lockedResponse();
+    if(locked) return locked;
+    try{
+      const cred = body.credential;
+      const clientDataBytes = b64urlDecode(cred.response.clientDataJSON);
+      const clientData = parseClientData(clientDataBytes, "webauthn.get", env);
+      if(!clientData) return fail();
+      const taken = await adminAuthCall(authStub, { action: "takeChallenge", challenge: clientData.challenge });
+      if(!taken.valid) return fail();
+      const stored = await adminAuthCall(authStub, { action: "getCredential", id: cred.id });
+      if(!stored.credential) return fail();
+      const authData = b64urlDecode(cred.response.authenticatorData);
+      const parsed = parseAuthData(authData);
+      const expectedRpIdHash = await sha256(new TextEncoder().encode(env.ADMIN_RP_ID));
+      if(!bytesEqual(parsed.rpIdHash, expectedRpIdHash)) return fail();
+      if(!(parsed.flags & 0x01) || !(parsed.flags & 0x04)) return fail();
+      const clientDataHash = await sha256(clientDataBytes);
+      const signedData = concatBytes(authData, clientDataHash);
+      const signature = b64urlDecode(cred.response.signature);
+      const ok = await verifyAssertionSignature(stored.credential, signedData, signature);
+      if(!ok) return fail();
+      const previous = stored.credential.signCount || 0;
+      if((previous !== 0 || parsed.signCount !== 0) && parsed.signCount <= previous) return fail();
+      await adminAuthCall(authStub, { action: "updateSignCount", id: cred.id, signCount: parsed.signCount });
+    }catch(e){
+      return fail();
+    }
+    await adminAuthCall(authStub, { action: "resetAttempts", ip });
+    const issued = await adminAuthCall(authStub, { action: "issue" });
+    return adminJson({ token: issued.token });
+  }
+
+  if(body.action === "registerOptions" || body.action === "register"){
+    let authorized = false;
+    if(body.token){
+      const verified = await adminAuthCall(authStub, { action: "verify", token: body.token });
+      authorized = Boolean(verified.valid);
+    }
+    let viaSetup = false;
+    if(!authorized){
+      const locked = await lockedResponse();
+      if(locked) return locked;
+      const list = await adminAuthCall(authStub, { action: "listCredentialIds" });
+      if(list.ids.length === 0 && env.ADMIN_SETUP_CODE && await secretEquals(body.setupCode, env.ADMIN_SETUP_CODE)){
+        authorized = true;
+        viaSetup = true;
+      }
+    }
+    if(!authorized) return fail();
+
+    if(body.action === "registerOptions"){
+      const list = await adminAuthCall(authStub, { action: "listCredentialIds" });
+      const issued = await adminAuthCall(authStub, { action: "newChallenge" });
+      return adminJson({
+        publicKey: {
+          challenge: issued.challenge,
+          rp: { id: env.ADMIN_RP_ID, name: "Simple Typing Admin" },
+          user: { id: b64urlEncode(new TextEncoder().encode("admin")), name: "admin", displayName: "admin" },
+          pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+          authenticatorSelection: { residentKey: "required", requireResidentKey: true, userVerification: "required" },
+          excludeCredentials: list.ids.map(id => ({ id })),
+          attestation: "none",
+          timeout: 60000
+        }
+      });
+    }
+
+    try{
+      const cred = body.credential;
+      const clientDataBytes = b64urlDecode(cred.response.clientDataJSON);
+      const clientData = parseClientData(clientDataBytes, "webauthn.create", env);
+      if(!clientData) return adminJson({ error: "invalid_credential" }, 400);
+      const taken = await adminAuthCall(authStub, { action: "takeChallenge", challenge: clientData.challenge });
+      if(!taken.valid) return adminJson({ error: "invalid_credential" }, 400);
+      const attestation = cborDecode(b64urlDecode(cred.response.attestationObject), 0).value;
+      const authData = attestation.get("authData");
+      const parsed = parseAuthData(authData);
+      const expectedRpIdHash = await sha256(new TextEncoder().encode(env.ADMIN_RP_ID));
+      if(!bytesEqual(parsed.rpIdHash, expectedRpIdHash)) return adminJson({ error: "invalid_credential" }, 400);
+      if(!(parsed.flags & 0x01) || !(parsed.flags & 0x04) || !(parsed.flags & 0x40)) return adminJson({ error: "invalid_credential" }, 400);
+      let offset = 37 + 16;
+      const credIdLength = (authData[offset] << 8) | authData[offset + 1];
+      offset += 2;
+      const credId = authData.slice(offset, offset + credIdLength);
+      offset += credIdLength;
+      const key = coseToCredentialKey(cborDecode(authData, offset).value);
+      if(!key) return adminJson({ error: "unsupported_key" }, 400);
+      const saved = await adminAuthCall(authStub, {
+        action: "saveCredential",
+        credential: { id: b64urlEncode(credId), alg: key.alg, jwk: key.jwk, signCount: parsed.signCount, createdAt: Date.now() }
+      });
+      if(saved.error) return adminJson({ error: saved.error }, 400);
+    }catch(e){
+      return adminJson({ error: "invalid_credential" }, 400);
+    }
+
+    if(viaSetup){
+      const issued = await adminAuthCall(authStub, { action: "issue" });
+      return adminJson({ ok: true, token: issued.token });
+    }
+    return adminJson({ ok: true });
+  }
+
+  return null;
 }
 
 async function handleAdmin(request, env){
@@ -1635,39 +2051,9 @@ async function handleAdmin(request, env){
   const authId = env.ADMIN_AUTH.idFromName("global");
   const authStub = env.ADMIN_AUTH.get(authId);
 
-  if(body.action === "login"){
-    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-
-    const lockRes = await authStub.fetch(new Request("https://internal/auth", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "checkLock", ip })
-    }));
-    const lockData = await lockRes.json();
-    if(lockData.locked){
-      return new Response(JSON.stringify({ error: "locked", retryAfterSeconds: lockData.retryAfterSeconds }), { status: 429, headers: corsHeaders() });
-    }
-
-    if(body.password !== env.ADMIN_PASSWORD){
-      await authStub.fetch(new Request("https://internal/auth", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "recordFailure", ip })
-      }));
-      return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
-    }
-
-    await authStub.fetch(new Request("https://internal/auth", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "resetAttempts", ip })
-    }));
-    const res = await authStub.fetch(new Request("https://internal/auth", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "issue" })
-    }));
-    return new Response(await res.text(), { headers: corsHeaders() });
+  if(request.method === "POST"){
+    const passkeyResponse = await handlePasskeyAdmin(body, request, env, authStub);
+    if(passkeyResponse) return passkeyResponse;
   }
 
   const verifyRes = await authStub.fetch(new Request("https://internal/auth", {
