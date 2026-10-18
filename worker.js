@@ -1845,8 +1845,35 @@ export class AdminAuth {
     if(body.action === "updateSignCount"){
       if(this.credentials[body.id]){
         this.credentials[body.id].signCount = body.signCount;
+        this.credentials[body.id].lastUsedAt = Date.now();
         await this.state.storage.put("credentials", this.credentials);
       }
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "listCredentials"){
+      const list = Object.keys(this.credentials).map(id => {
+        const c = this.credentials[id];
+        return {
+          id,
+          label: c.label || "不明な端末",
+          createdAt: c.createdAt || 0,
+          lastUsedAt: c.lastUsedAt || 0
+        };
+      });
+      list.sort((a, b) => b.createdAt - a.createdAt);
+      return new Response(JSON.stringify({ credentials: list }), { headers: corsHeaders() });
+    }
+
+    if(body.action === "deleteCredential"){
+      if(typeof body.id !== "string" || !this.credentials[body.id]){
+        return new Response(JSON.stringify({ error: "not_found" }), { status: 404, headers: corsHeaders() });
+      }
+      if(Object.keys(this.credentials).length <= 1){
+        return new Response(JSON.stringify({ error: "last_credential" }), { status: 400, headers: corsHeaders() });
+      }
+      delete this.credentials[body.id];
+      await this.state.storage.put("credentials", this.credentials);
       return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
     }
 
@@ -1875,6 +1902,26 @@ export class AdminAuth {
 
     return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
   }
+}
+
+function describeDevice(ua){
+  const s = String(ua || "");
+  let os = "不明なOS";
+  if(/iPhone/.test(s)) os = "iPhone";
+  else if(/iPad/.test(s)) os = "iPad";
+  else if(/Android/.test(s)) os = "Android";
+  else if(/Windows/.test(s)) os = "Windows";
+  else if(/Mac OS X|Macintosh/.test(s)) os = "Mac";
+  else if(/CrOS/.test(s)) os = "ChromeOS";
+  else if(/Linux/.test(s)) os = "Linux";
+  let browser = "不明なブラウザ";
+  if(/Edg\//.test(s)) browser = "Edge";
+  else if(/OPR\/|Opera/.test(s)) browser = "Opera";
+  else if(/SamsungBrowser/.test(s)) browser = "Samsung Internet";
+  else if(/Firefox|FxiOS/.test(s)) browser = "Firefox";
+  else if(/Chrome|CriOS/.test(s)) browser = "Chrome";
+  else if(/Safari/.test(s)) browser = "Safari";
+  return `${os} / ${browser}`;
 }
 
 async function adminAuthCall(stub, payload){
@@ -2011,7 +2058,15 @@ async function handlePasskeyAdmin(body, request, env, authStub){
       if(!key) return adminJson({ error: "unsupported_key" }, 400);
       const saved = await adminAuthCall(authStub, {
         action: "saveCredential",
-        credential: { id: b64urlEncode(credId), alg: key.alg, jwk: key.jwk, signCount: parsed.signCount, createdAt: Date.now() }
+        credential: {
+          id: b64urlEncode(credId),
+          alg: key.alg,
+          jwk: key.jwk,
+          signCount: parsed.signCount,
+          createdAt: Date.now(),
+          lastUsedAt: 0,
+          label: describeDevice(request.headers.get("User-Agent"))
+        }
       });
       if(saved.error) return adminJson({ error: saved.error }, 400);
     }catch(e){
@@ -2064,6 +2119,20 @@ async function handleAdmin(request, env){
   const verifyData = await verifyRes.json();
   if(!verifyData.valid){
     return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+  }
+
+  if(body.action === "listPasskeys"){
+    const data = await adminAuthCall(authStub, { action: "listCredentials" });
+    return new Response(JSON.stringify(data), { headers: corsHeaders() });
+  }
+
+  if(body.action === "deletePasskey"){
+    const res = await authStub.fetch(new Request("https://internal/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "deleteCredential", id: body.id })
+    }));
+    return new Response(await res.text(), { status: res.status, headers: corsHeaders() });
   }
 
   if(body.action === "list" || !body.action){
