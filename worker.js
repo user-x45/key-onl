@@ -1575,7 +1575,8 @@ export class Presence {
       activity: "idle",
       mode: "",
       level: "",
-      name: "GUEST"
+      name: "GUEST",
+      page: "main"
     };
     this.clients.set(ws, entry);
     this.ensureTick();
@@ -1596,7 +1597,9 @@ export class Presence {
       const mode = active && RANKING_MODES.includes(msg.mode) ? msg.mode : "";
       const level = active && RANKING_LEVELS.includes(msg.level) ? msg.level : "";
       const name = sanitizeRankingName(msg.name);
-      if(entry.activity === activity && entry.mode === mode && entry.level === level && entry.name === name) return;
+      const page = msg.page === "event" ? "event" : "main";
+      if(entry.activity === activity && entry.mode === mode && entry.level === level && entry.name === name && entry.page === page) return;
+      entry.page = page;
       entry.activity = activity;
       entry.mode = mode;
       entry.level = level;
@@ -1641,6 +1644,7 @@ export class Presence {
         activity: entry.activity,
         mode: entry.mode,
         level: entry.level,
+        page: entry.page,
         ip: entry.ip,
         userAgent: entry.userAgent,
         connectedMs: now - entry.connectedAt
