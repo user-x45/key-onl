@@ -1510,6 +1510,237 @@ async function handlePlayLog(request, env){
   return new Response(await res.text(), { headers: corsHeaders() });
 }
 
+const PRESENCE_ACTIVITIES = ["idle", "solo", "online", "friend", "matching"];
+const PRESENCE_MAX_CLIENTS = 2000;
+const PRESENCE_MAX_ADMINS = 10;
+const PRESENCE_STALE_MS = 150000;
+const PRESENCE_TICK_MS = 5000;
+const PRESENCE_HEARTBEAT_MS = 25000;
+const PRESENCE_ADMIN_RECHECK_MS = 60000;
+const PRESENCE_BROADCAST_MIN_MS = 1000;
+const PRESENCE_MESSAGE_MAX = 512;
+
+export class Presence {
+  constructor(state, env){
+    this.state = state;
+    this.env = env;
+    this.clients = new Map();
+    this.admins = new Map();
+    this.nextId = 1;
+    this.lastBroadcastAt = 0;
+    this.broadcastTimer = null;
+    this.tickTimer = null;
+  }
+
+  async fetch(request){
+    const url = new URL(request.url);
+
+    if(request.method === "POST" && url.pathname === "/presence-snapshot"){
+      return new Response(JSON.stringify(this.buildSnapshot()), { headers: corsHeaders() });
+    }
+
+    if(request.headers.get("Upgrade") !== "websocket"){
+      return new Response("expected websocket", { status: 426 });
+    }
+
+    if(url.pathname === "/admin-presence"){
+      if(this.admins.size >= PRESENCE_MAX_ADMINS){
+        return new Response("too many admin connections", { status: 503 });
+      }
+      const adminPair = new WebSocketPair();
+      const [adminClient, adminServer] = Object.values(adminPair);
+      adminServer.accept();
+      this.attachAdmin(adminServer, request);
+      return new Response(null, { status: 101, webSocket: adminClient, headers: { "Sec-WebSocket-Protocol": "admin-presence" } });
+    }
+
+    if(this.clients.size >= PRESENCE_MAX_CLIENTS){
+      return new Response("too many connections", { status: 503 });
+    }
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    server.accept();
+    this.attachClient(server, request);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  attachClient(ws, request){
+    const now = Date.now();
+    const entry = {
+      id: this.nextId++,
+      ip: String(request.headers.get("CF-Connecting-IP") || "unknown").slice(0, 64),
+      userAgent: String(request.headers.get("User-Agent") || "unknown").slice(0, 300),
+      connectedAt: now,
+      lastSeen: now,
+      activity: "idle",
+      mode: "",
+      level: "",
+      name: "GUEST"
+    };
+    this.clients.set(ws, entry);
+    this.ensureTick();
+    this.scheduleBroadcast();
+
+    ws.addEventListener("message", (event) => {
+      entry.lastSeen = Date.now();
+      if(typeof event.data !== "string" || event.data.length > PRESENCE_MESSAGE_MAX) return;
+      let msg;
+      try{
+        msg = JSON.parse(event.data);
+      }catch(e){
+        return;
+      }
+      if(!msg || msg.type !== "state") return;
+      const activity = PRESENCE_ACTIVITIES.includes(msg.activity) ? msg.activity : "idle";
+      const active = activity !== "idle";
+      const mode = active && RANKING_MODES.includes(msg.mode) ? msg.mode : "";
+      const level = active && RANKING_LEVELS.includes(msg.level) ? msg.level : "";
+      const name = sanitizeRankingName(msg.name);
+      if(entry.activity === activity && entry.mode === mode && entry.level === level && entry.name === name) return;
+      entry.activity = activity;
+      entry.mode = mode;
+      entry.level = level;
+      entry.name = name;
+      this.scheduleBroadcast();
+    });
+
+    const drop = () => this.dropClient(ws);
+    ws.addEventListener("close", drop);
+    ws.addEventListener("error", drop);
+  }
+
+  attachAdmin(ws, request){
+    const protocols = String(request.headers.get("Sec-WebSocket-Protocol") || "").split(",").map(p => p.trim());
+    this.admins.set(ws, { token: protocols[1] || "", lastCheck: Date.now() });
+    this.ensureTick();
+    try{
+      ws.send(JSON.stringify(this.buildSnapshot()));
+    }catch(e){}
+
+    const drop = () => {
+      this.admins.delete(ws);
+      this.stopTickIfIdle();
+    };
+    ws.addEventListener("close", drop);
+    ws.addEventListener("error", drop);
+  }
+
+  dropClient(ws){
+    if(!this.clients.delete(ws)) return;
+    this.scheduleBroadcast();
+    this.stopTickIfIdle();
+  }
+
+  buildSnapshot(){
+    const now = Date.now();
+    const clients = [];
+    for(const entry of this.clients.values()){
+      clients.push({
+        id: entry.id,
+        name: entry.name,
+        activity: entry.activity,
+        mode: entry.mode,
+        level: entry.level,
+        ip: entry.ip,
+        userAgent: entry.userAgent,
+        connectedMs: now - entry.connectedAt
+      });
+    }
+    return { type: "snapshot", clients };
+  }
+
+  scheduleBroadcast(){
+    if(this.admins.size === 0 || this.broadcastTimer) return;
+    const wait = Math.max(0, this.lastBroadcastAt + PRESENCE_BROADCAST_MIN_MS - Date.now());
+    this.broadcastTimer = setTimeout(() => {
+      this.broadcastTimer = null;
+      this.broadcast();
+    }, wait);
+  }
+
+  broadcast(){
+    this.lastBroadcastAt = Date.now();
+    if(this.admins.size === 0) return;
+    const payload = JSON.stringify(this.buildSnapshot());
+    for(const ws of this.admins.keys()){
+      try{
+        ws.send(payload);
+      }catch(e){}
+    }
+  }
+
+  ensureTick(){
+    if(this.tickTimer) return;
+    this.tickTimer = setInterval(() => this.tick(), PRESENCE_TICK_MS);
+  }
+
+  stopTickIfIdle(){
+    if(this.tickTimer && this.clients.size === 0 && this.admins.size === 0){
+      clearInterval(this.tickTimer);
+      this.tickTimer = null;
+    }
+  }
+
+  tick(){
+    const now = Date.now();
+    for(const [ws, entry] of this.clients){
+      if(now - entry.lastSeen > PRESENCE_STALE_MS){
+        this.dropClient(ws);
+        try{
+          ws.close(1001, "stale");
+        }catch(e){}
+      }
+    }
+    for(const [ws, admin] of this.admins){
+      if(now - admin.lastCheck >= PRESENCE_ADMIN_RECHECK_MS){
+        admin.lastCheck = now;
+        this.recheckAdmin(ws, admin);
+      }
+    }
+    if(this.admins.size > 0 && now - this.lastBroadcastAt >= PRESENCE_HEARTBEAT_MS){
+      this.scheduleBroadcast();
+    }
+  }
+
+  async recheckAdmin(ws, admin){
+    let valid = true;
+    try{
+      const stub = this.env.ADMIN_AUTH.get(this.env.ADMIN_AUTH.idFromName("global"));
+      const data = await adminAuthCall(stub, { action: "verify", token: admin.token });
+      valid = Boolean(data.valid);
+    }catch(e){
+      return;
+    }
+    if(valid) return;
+    this.admins.delete(ws);
+    try{
+      ws.close(4401, "unauthorized");
+    }catch(e){}
+    this.stopTickIfIdle();
+  }
+}
+
+async function handleAdminPresence(request, env){
+  if(request.headers.get("Upgrade") !== "websocket"){
+    return new Response("expected websocket", { status: 426 });
+  }
+  if(!env.PRESENCE){
+    return new Response("presence not configured", { status: 503 });
+  }
+  const protocols = String(request.headers.get("Sec-WebSocket-Protocol") || "").split(",").map(p => p.trim());
+  const token = protocols[0] === "admin-presence" ? protocols[1] || "" : "";
+  if(!token){
+    return new Response("unauthorized", { status: 401 });
+  }
+  const authStub = env.ADMIN_AUTH.get(env.ADMIN_AUTH.idFromName("global"));
+  const verified = await adminAuthCall(authStub, { action: "verify", token });
+  if(!verified.valid){
+    return new Response("unauthorized", { status: 401 });
+  }
+  const stub = env.PRESENCE.get(env.PRESENCE.idFromName("global"));
+  return stub.fetch(request);
+}
+
 const ADMIN_TOKEN_TTL_MS = 30 * 60 * 1000;
 const ADMIN_MAX_ATTEMPTS = 5;
 const ADMIN_ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
@@ -2261,6 +2492,19 @@ async function handleAdmin(request, env){
     return new Response(await res.text(), { headers: corsHeaders() });
   }
 
+  if(body.action === "presenceSnapshot"){
+    if(!env.PRESENCE){
+      return new Response(JSON.stringify({ error: "presence_not_configured" }), { status: 503, headers: corsHeaders() });
+    }
+    const presenceStub = env.PRESENCE.get(env.PRESENCE.idFromName("global"));
+    const presenceRes = await presenceStub.fetch(new Request("https://internal/presence-snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "snapshot" })
+    }));
+    return new Response(await presenceRes.text(), { headers: corsHeaders() });
+  }
+
   if(body.action === "listPlayLog"){
     const id = env.PLAY_LOG.idFromName("global");
     const stub = env.PLAY_LOG.get(id);
@@ -2356,6 +2600,18 @@ export default {
 
     if(url.pathname === "/playlog"){
       return handlePlayLog(request, env);
+    }
+
+    if(url.pathname === "/presence"){
+      if(!env.PRESENCE){
+        return new Response("presence not configured", { status: 503 });
+      }
+      const presenceStub = env.PRESENCE.get(env.PRESENCE.idFromName("global"));
+      return presenceStub.fetch(request);
+    }
+
+    if(url.pathname === "/admin-presence"){
+      return handleAdminPresence(request, env);
     }
 
     if(url.pathname === "/ranking"){
