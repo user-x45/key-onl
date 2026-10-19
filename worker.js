@@ -1511,6 +1511,9 @@ async function handlePlayLog(request, env){
 }
 
 const PRESENCE_ACTIVITIES = ["idle", "solo", "online", "friend", "matching"];
+const PRESENCE_PLAYING = ["solo", "online", "friend"];
+const PRESENCE_WORD_MAX = 100;
+const PRESENCE_SCORE_MAX = 99999;
 const PRESENCE_MAX_CLIENTS = 2000;
 const PRESENCE_MAX_ADMINS = 10;
 const PRESENCE_STALE_MS = 150000;
@@ -1575,7 +1578,9 @@ export class Presence {
       activity: "idle",
       mode: "",
       level: "",
-      name: "GUEST"
+      name: "GUEST",
+      score: 0,
+      word: ""
     };
     this.clients.set(ws, entry);
     this.ensureTick();
@@ -1596,11 +1601,16 @@ export class Presence {
       const mode = active && RANKING_MODES.includes(msg.mode) ? msg.mode : "";
       const level = active && RANKING_LEVELS.includes(msg.level) ? msg.level : "";
       const name = sanitizeRankingName(msg.name);
-      if(entry.activity === activity && entry.mode === mode && entry.level === level && entry.name === name) return;
+      const playing = PRESENCE_PLAYING.includes(activity);
+      const score = playing ? Math.min(PRESENCE_SCORE_MAX, Math.max(0, Math.floor(Number(msg.score) || 0))) : 0;
+      const word = playing ? String(msg.word || "").slice(0, PRESENCE_WORD_MAX) : "";
+      if(entry.activity === activity && entry.mode === mode && entry.level === level && entry.name === name && entry.score === score && entry.word === word) return;
       entry.activity = activity;
       entry.mode = mode;
       entry.level = level;
       entry.name = name;
+      entry.score = score;
+      entry.word = word;
       this.scheduleBroadcast();
     });
 
@@ -1641,6 +1651,8 @@ export class Presence {
         activity: entry.activity,
         mode: entry.mode,
         level: entry.level,
+        score: entry.score,
+        word: entry.word,
         ip: entry.ip,
         userAgent: entry.userAgent,
         connectedMs: now - entry.connectedAt
