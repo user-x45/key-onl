@@ -27,6 +27,118 @@ async function pickDeck(mode, level){
   return deck;
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const rateBuckets = new Map();
+
+const GAME_MIN_ELAPSED_MS = 80000;
+const GAME_TTL_MS = 1800000;
+const GAME_DONE_TTL_MS = 1800000;
+const GAME_MAX_CHARS = 2000;
+const GAME_SUSPICIOUS_CHARS = 1100;
+const GAME_MAX_PLAY_MS = 120000;
+const GAME_WORD_LENGTH_MARGIN = 1.5;
+const GAME_MAX_MISS = 50000;
+const GAME_START_PER_MIN = 600;
+const GAME_MAX_FAILS = 3;
+const GAME_IV_MIN_CV = 0.03;
+const GAME_IV_MIN_SAMPLES = 50;
+const GAME_IV_MIN_MS = 5;
+const WORD_BOUNDS_TTL_MS = 600000;
+const wordBoundsCache = {};
+
+const MATCH_COUNTDOWN_MS = 2500;
+const MATCH_PLAY_END_MS = 106000;
+const MATCH_MIN_FINISH_MS = 98000;
+const MATCH_MAX_CHARS_PER_SEC = 20;
+const MATCH_CHAR_BURST = 30;
+const MATCH_MAX_MISS = 50000;
+const MATCH_MAX_MESSAGE_LENGTH = 256;
+
+function isValidModeLevel(mode, level){
+  return RANKING_MODES.includes(mode) && RANKING_LEVELS.includes(level);
+}
+
+function getClientIp(request){
+  return request.headers.get("CF-Connecting-IP") || "unknown";
+}
+
+function rateLimited(key, max, windowMs){
+  const now = Date.now();
+  if(rateBuckets.size > 5000){
+    for(const [k, v] of rateBuckets){
+      if(v.length === 0 || now - v[v.length - 1] > 120000) rateBuckets.delete(k);
+    }
+    if(rateBuckets.size > 5000) rateBuckets.clear();
+  }
+  const list = (rateBuckets.get(key) || []).filter(t => now - t < windowMs);
+  if(list.length >= max){
+    rateBuckets.set(key, list);
+    return true;
+  }
+  list.push(now);
+  rateBuckets.set(key, list);
+  return false;
+}
+
+function tooManyRequests(){
+  return new Response(JSON.stringify({ error: "rate_limited" }), { status: 429, headers: corsHeaders() });
+}
+
+async function getWordBounds(mode, level){
+  const key = `${mode}-${level}`;
+  const cached = wordBoundsCache[key];
+  if(cached && Date.now() - cached.at < WORD_BOUNDS_TTL_MS) return cached.bounds;
+  try{
+    const res = await fetch(`${WORDS_BASE_URL}/${key}.json`);
+    if(!res.ok) return cached ? cached.bounds : null;
+    const list = await res.json();
+    if(!Array.isArray(list) || list.length === 0) return null;
+    let min = Infinity;
+    let max = 0;
+    for(const word of list){
+      if(typeof word !== "string") return null;
+      if(word.length < min) min = word.length;
+      if(word.length > max) max = word.length;
+    }
+    if(!Number.isFinite(min) || max === 0) return null;
+    const bounds = { min, max };
+    wordBoundsCache[key] = { bounds, at: Date.now() };
+    return bounds;
+  }catch(e){
+    return cached ? cached.bounds : null;
+  }
+}
+
+function isHumanTiming(iv, words){
+  if(!iv || typeof iv !== "object") return false;
+  const { n, mean, std, min } = iv;
+  if(!Number.isInteger(n) || Math.abs(n - words) > 2) return false;
+  if(![mean, std, min].every(v => typeof v === "number" && Number.isFinite(v))) return false;
+  if(mean <= 0 || std < 0 || min < GAME_IV_MIN_MS) return false;
+  if(mean * n > GAME_MAX_PLAY_MS) return false;
+  if(n >= GAME_IV_MIN_SAMPLES && std / mean < GAME_IV_MIN_CV) return false;
+  return true;
+}
+
+async function fetchVerifiedGame(env, mode, level, gameId){
+  if(!isValidModeLevel(mode, level)) return null;
+  if(typeof gameId !== "string" || !UUID_RE.test(gameId)) return null;
+  if(!env.RANKING) return null;
+  const stub = env.RANKING.get(env.RANKING.idFromName(`${mode}:${level}`));
+  try{
+    const res = await stub.fetch(new Request(`https://internal/ranking?mode=${mode}&level=${level}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "getVerifiedGame", gameId })
+    }));
+    if(!res.ok) return null;
+    const data = await res.json();
+    return data.game || null;
+  }catch(e){
+    return null;
+  }
+}
+
 export class Lobby {
   constructor(state, env){
     this.state = state;
@@ -41,6 +153,9 @@ export class Lobby {
     const url = new URL(request.url);
     const mode = url.searchParams.get("mode") || "hiragana";
     const level = url.searchParams.get("level") || "beginner";
+    if(!isValidModeLevel(mode, level)){
+      return new Response("bad request", { status: 400 });
+    }
     const name = String(url.searchParams.get("name") || "GUEST").trim().slice(0, 6) || "GUEST";
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -154,6 +269,9 @@ export class FriendRoom {
     const url = new URL(request.url);
 
     if(request.method === "POST"){
+      if(url.hostname !== "internal"){
+        return new Response("forbidden", { status: 403 });
+      }
       let body = {};
       try{
         body = await request.json();
@@ -178,6 +296,9 @@ export class FriendRoom {
     const code = url.pathname.split("/")[2];
     const mode = url.searchParams.get("mode") || "hiragana";
     const level = url.searchParams.get("level") || "beginner";
+    if(!isValidModeLevel(mode, level)){
+      return new Response("bad request", { status: 400 });
+    }
 
     if(this.expiresAt === null){
       if(role === "guest"){
@@ -331,9 +452,10 @@ export class Match {
     this.level = "beginner";
     this.wordDeck = null;
     this.scores = {
-      p1: { score: 0, miss: 0, finished: false },
-      p2: { score: 0, miss: 0, finished: false }
+      p1: { score: 0, miss: 0, chars: 0, finished: false },
+      p2: { score: 0, miss: 0, chars: 0, finished: false }
     };
+    this.startedAt = 0;
     this.ended = false;
     this.waitTimeoutId = null;
   }
@@ -346,8 +468,11 @@ export class Match {
     }
     const mode = url.searchParams.get("mode");
     const level = url.searchParams.get("level");
-    if(mode) this.mode = mode;
-    if(level) this.level = level;
+    if(mode && RANKING_MODES.includes(mode) && !this.wordDeck) this.mode = mode;
+    if(level && RANKING_LEVELS.includes(level) && !this.wordDeck) this.level = level;
+    if(this.players[role]){
+      return new Response("role taken", { status: 409 });
+    }
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -385,21 +510,36 @@ export class Match {
 
   attach(ws, role){
     ws.addEventListener("message", (event) => {
+      if(typeof event.data !== "string" || event.data.length > MATCH_MAX_MESSAGE_LENGTH) return;
       let msg;
       try{ msg = JSON.parse(event.data); }catch(e){ return; }
+      if(!msg || typeof msg !== "object") return;
+      if(!this.startedAt || !this.wordDeck || this.ended) return;
+
+      const state = this.scores[role];
+      if(state.finished) return;
+      const elapsed = Date.now() - this.startedAt;
 
       if(msg.type === "progress"){
-        this.scores[role].score = msg.score;
+        if(elapsed > MATCH_PLAY_END_MS) return;
+        if(msg.score !== state.score + 1) return;
+        const word = this.wordDeck[state.score % this.wordDeck.length];
+        const nextChars = state.chars + (typeof word === "string" ? word.length : 1);
+        const playSec = Math.max(0, elapsed - MATCH_COUNTDOWN_MS) / 1000;
+        if(nextChars > MATCH_MAX_CHARS_PER_SEC * playSec + MATCH_CHAR_BURST) return;
+        state.score += 1;
+        state.chars = nextChars;
         const other = role === "p1" ? "p2" : "p1";
         if(this.players[other]){
           try{
-            this.players[other].send(JSON.stringify({ type: "opponentProgress", score: msg.score }));
+            this.players[other].send(JSON.stringify({ type: "opponentProgress", score: state.score }));
           }catch(e){}
         }
       } else if(msg.type === "finished"){
-        this.scores[role].score = msg.score;
-        this.scores[role].miss = msg.miss;
-        this.scores[role].finished = true;
+        if(elapsed < MATCH_MIN_FINISH_MS) return;
+        const miss = msg.miss;
+        state.miss = Number.isInteger(miss) && miss >= 0 && miss <= MATCH_MAX_MISS ? miss : 0;
+        state.finished = true;
         this.maybeEnd(false);
       }
     });
@@ -418,6 +558,7 @@ export class Match {
 
   async startMatch(){
     this.wordDeck = await pickDeck(this.mode, this.level);
+    this.startedAt = Date.now();
     for(const role of ["p1", "p2"]){
       try{
         this.players[role].send(JSON.stringify({
@@ -610,6 +751,8 @@ export class Ranking {
     this.state = state;
     this.env = env;
     this.scores = null;
+    this.startLog = new Map();
+    this.lastCleanup = 0;
   }
 
   async load(){
@@ -619,12 +762,222 @@ export class Ranking {
     this.scores = list.map(entry => typeof entry === "object" && entry !== null ? entry : { score: entry, name: "GUEST" });
   }
 
+  jsonResponse(data, status){
+    return new Response(JSON.stringify(data), { status: status || 200, headers: corsHeaders() });
+  }
+
+  async cleanupGames(now){
+    if(now - this.lastCleanup < 60000) return;
+    this.lastCleanup = now;
+    const games = await this.state.storage.list({ prefix: "g:", limit: 1000 });
+    const expired = [];
+    for(const [key, rec] of games){
+      if(!rec || typeof rec.exp !== "number" || rec.exp < now) expired.push(key);
+    }
+    for(let i = 0; i < expired.length; i += 128){
+      await this.state.storage.delete(expired.slice(i, i + 128));
+    }
+  }
+
+  async startGame(ip){
+    const now = Date.now();
+    if(this.startLog.size > 2000){
+      for(const [k, v] of this.startLog){
+        if(v.length === 0 || now - v[v.length - 1] > 60000) this.startLog.delete(k);
+      }
+    }
+    const recent = (this.startLog.get(ip) || []).filter(t => now - t < 60000);
+    if(recent.length >= GAME_START_PER_MIN){
+      this.startLog.set(ip, recent);
+      return null;
+    }
+    recent.push(now);
+    this.startLog.set(ip, recent);
+    await this.cleanupGames(now);
+    const gameId = crypto.randomUUID();
+    await this.state.storage.put(`g:${gameId}`, { t: now, exp: now + GAME_TTL_MS });
+    return gameId;
+  }
+
+  async rejectGame(key, rec, error, detail){
+    console.warn("game rejected", error, JSON.stringify(detail));
+    rec.fails = (rec.fails || 0) + 1;
+    if(rec.fails >= GAME_MAX_FAILS){
+      await this.state.storage.delete(key);
+    } else {
+      await this.state.storage.put(key, rec);
+    }
+    return { error };
+  }
+
+  async finishGame(mode, level, body){
+    const now = Date.now();
+    const gameId = String(body.gameId || "");
+    if(!UUID_RE.test(gameId)) return { error: "invalid_game" };
+    const bounds = await getWordBounds(mode, level);
+    const key = `g:${gameId}`;
+    const rec = await this.state.storage.get(key);
+    if(!rec || rec.exp < now) return { error: "invalid_game" };
+    if(rec.result) return { result: rec.result };
+
+    const elapsed = now - rec.t;
+    if(elapsed < GAME_MIN_ELAPSED_MS) return { error: "too_early" };
+
+    const words = body.words;
+    const chars = body.chars;
+    const miss = body.miss;
+    const detail = { gameId, mode, level, words, chars, miss, iv: body.iv, elapsed };
+    if(!Number.isInteger(words) || !Number.isInteger(chars) || !Number.isInteger(miss)){
+      return this.rejectGame(key, rec, "invalid_stats", detail);
+    }
+    if(words < 0 || chars < 0 || miss < 0 || words > chars || chars > GAME_MAX_CHARS || miss > GAME_MAX_MISS){
+      return this.rejectGame(key, rec, "invalid_stats", detail);
+    }
+    if(words > 0){
+      if(bounds && chars > words * bounds.max * GAME_WORD_LENGTH_MARGIN){
+        return this.rejectGame(key, rec, "invalid_stats", detail);
+      }
+      if(!isHumanTiming(body.iv, words)){
+        return this.rejectGame(key, rec, "invalid_timing", detail);
+      }
+    }
+    if(chars > GAME_SUSPICIOUS_CHARS){
+      console.warn("game accepted but suspicious", JSON.stringify(detail));
+    }
+
+    const speed = Math.round((chars / 100) * 60);
+    const baseScore = words * 100 + speed * 2;
+    const missPenalty = Math.min(miss * 30, baseScore * 0.5);
+    const score = Math.max(0, Math.round(baseScore - missPenalty));
+    const attempts = words + miss;
+    const accuracy = attempts === 0 ? 0 : Math.round((words / attempts) * 100);
+    rec.result = { score, accuracy, speed, miss, words, chars };
+    rec.exp = now + GAME_DONE_TTL_MS;
+    await this.state.storage.put(key, rec);
+    return { result: rec.result };
+  }
+
+  async getVerifiedGame(rawGameId){
+    const gameId = String(rawGameId || "");
+    if(!UUID_RE.test(gameId)) return null;
+    const rec = await this.state.storage.get(`g:${gameId}`);
+    if(!rec || !rec.result || rec.exp < Date.now()) return null;
+    return rec.result;
+  }
+
+  async submitScore(mode, level, body, internal){
+    const gameId = String(body.gameId || "");
+    if(!UUID_RE.test(gameId)){
+      return this.jsonResponse({ error: "game_required" }, 400);
+    }
+
+    let eventEnabled = false;
+    let eventMonth = "";
+    let eventCombos = [];
+    if(this.env.EVENT_SETTINGS){
+      const eventId = this.env.EVENT_SETTINGS.idFromName("global");
+      const eventStub = this.env.EVENT_SETTINGS.get(eventId);
+      const eventRes = await eventStub.fetch(new Request("https://internal/event", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "get" })
+      }));
+      const eventData = await eventRes.json();
+      eventEnabled = Boolean(eventData.enabled);
+      eventMonth = String(eventData.month || "");
+      eventCombos = Array.isArray(eventData.combos) ? eventData.combos : [];
+    }
+
+    let activeEventMonth = eventEnabled && eventMonth === getCurrentMonthJST() && eventCombos.includes(`${mode}:${level}`);
+    if(internal && body.__forceNormal){
+      activeEventMonth = false;
+    } else if(internal && body.__forceEvent){
+      activeEventMonth = true;
+      eventMonth = String(body.__eventMonth || eventMonth);
+    }
+
+    const key = `g:${gameId}`;
+    const rec = await this.state.storage.get(key);
+    if(!rec || !rec.result || rec.exp < Date.now()){
+      return this.jsonResponse({ error: "invalid_game" }, 400);
+    }
+    const score = rec.result.score;
+    if(score <= 0){
+      return this.jsonResponse({ error: "invalid_game" }, 400);
+    }
+
+    if(activeEventMonth){
+      const session = await resolveUserSession(this.env, body.token);
+      if(!session){
+        return this.jsonResponse({ error: "unauthorized" }, 401);
+      }
+      const monthKey = `monthScores:${eventMonth}`;
+      if(rec.usedEvent){
+        const current = (await this.state.storage.get(monthKey)) || [];
+        return this.jsonResponse({ rank: rec.eventRank || null, top20: stripSubs(current), eventMode: true, month: eventMonth, alreadySubmitted: true });
+      }
+      rec.usedEvent = true;
+      await this.state.storage.put(key, rec);
+
+      const stored = (await this.state.storage.get(monthKey)) || [];
+      const currentIndex = stored.findIndex(s => s.sub === session.sub);
+      let monthScores = stored;
+      let monthRank = null;
+      if(currentIndex === -1 || score > stored[currentIndex].score){
+        const others = stored.filter(s => s.sub !== session.sub);
+        let pos = 0;
+        while(pos < others.length && others[pos].score > score) pos++;
+        if(pos < RANKING_MAX){
+          others.splice(pos, 0, { score, name: session.name, sub: session.sub });
+          monthScores = others.slice(0, RANKING_MAX);
+          monthRank = pos + 1;
+          await this.state.storage.put(monthKey, monthScores);
+        }
+      }
+      rec.eventRank = monthRank;
+      await this.state.storage.put(key, rec);
+      return this.jsonResponse({ rank: monthRank, top20: stripSubs(monthScores), eventMode: true, month: eventMonth });
+    }
+
+    if(rec.usedNormal){
+      return this.jsonResponse({ rank: rec.normalRank || null, top20: this.scores, alreadySubmitted: true });
+    }
+    rec.usedNormal = true;
+    await this.state.storage.put(key, rec);
+
+    let name = sanitizeRankingName(body.name);
+    const nameCheck = await checkNameAllowed(this.env, name);
+    if(!nameCheck.ok && nameCheck.error === "name_blocked") name = "GUEST";
+
+    let rank = null;
+    const existingIndex = this.scores.findIndex(s => s.score === score && s.name === name);
+    if(existingIndex !== -1){
+      rank = existingIndex < RANKING_MAX ? existingIndex + 1 : null;
+    } else {
+      let pos = 0;
+      while(pos < this.scores.length && this.scores[pos].score > score) pos++;
+      if(pos < RANKING_MAX){
+        this.scores.splice(pos, 0, { score, name });
+        if(this.scores.length > RANKING_MAX){
+          this.scores = this.scores.slice(0, RANKING_MAX);
+        }
+        rank = pos + 1;
+        await this.state.storage.put("scores", this.scores);
+      }
+    }
+    rec.normalRank = rank;
+    await this.state.storage.put(key, rec);
+
+    return this.jsonResponse({ rank, top20: this.scores });
+  }
+
   async fetch(request){
     if(request.method === "OPTIONS"){
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
 
     const url = new URL(request.url);
+    const internal = url.hostname === "internal";
     const mode = url.searchParams.get("mode") || "hiragana";
     const level = url.searchParams.get("level") || "beginner";
 
@@ -639,124 +992,85 @@ export class Ranking {
       try{
         body = await request.json();
       }catch(e){
-        return new Response(JSON.stringify({ error: "invalid body" }), { status: 400, headers: corsHeaders() });
+        return this.jsonResponse({ error: "invalid body" }, 400);
+      }
+      if(!body || typeof body !== "object" || Array.isArray(body)){
+        return this.jsonResponse({ error: "invalid body" }, 400);
       }
 
-      if(body.action === "clear"){
-        this.scores = [];
-        await this.state.storage.put("scores", this.scores);
-        return new Response(JSON.stringify({ top20: this.scores }), { headers: corsHeaders() });
-      }
+      if(body.action !== undefined){
+        if(!internal){
+          return this.jsonResponse({ error: "forbidden" }, 403);
+        }
 
-      if(body.action === "delete"){
-        const target = Math.round(Number(body.score));
-        const idx = this.scores.findIndex(s => (typeof s === "object" && s !== null ? s.score : s) === target);
-        if(idx !== -1){
-          this.scores.splice(idx, 1);
+        if(body.action === "clear"){
+          this.scores = [];
           await this.state.storage.put("scores", this.scores);
+          return new Response(JSON.stringify({ top20: this.scores }), { headers: corsHeaders() });
         }
-        return new Response(JSON.stringify({ top20: this.scores }), { headers: corsHeaders() });
-      }
 
-      if(body.action === "getMonthRanking"){
-        const month = String(body.month || "");
-        const key = `monthScores:${month}`;
-        const monthScores = (await this.state.storage.get(key)) || [];
-        return new Response(JSON.stringify({ top20: stripSubs(monthScores) }), { headers: corsHeaders() });
-      }
-
-      if(body.action === "clearMonthRanking"){
-        const month = String(body.month || "");
-        const key = `monthScores:${month}`;
-        await this.state.storage.put(key, []);
-        return new Response(JSON.stringify({ top20: [] }), { headers: corsHeaders() });
-      }
-
-      if(body.action === "deleteMonthRanking"){
-        const month = String(body.month || "");
-        const key = `monthScores:${month}`;
-        const monthScores = (await this.state.storage.get(key)) || [];
-        const target = Math.round(Number(body.score));
-        const idx = monthScores.findIndex(s => s.score === target);
-        if(idx !== -1){
-          monthScores.splice(idx, 1);
-          await this.state.storage.put(key, monthScores);
+        if(body.action === "delete"){
+          const target = Math.round(Number(body.score));
+          const idx = this.scores.findIndex(s => (typeof s === "object" && s !== null ? s.score : s) === target);
+          if(idx !== -1){
+            this.scores.splice(idx, 1);
+            await this.state.storage.put("scores", this.scores);
+          }
+          return new Response(JSON.stringify({ top20: this.scores }), { headers: corsHeaders() });
         }
-        return new Response(JSON.stringify({ top20: stripSubs(monthScores) }), { headers: corsHeaders() });
-      }
 
-      let eventEnabled = false;
-      let eventMonth = "";
-      let eventCombos = [];
-      if(this.env.EVENT_SETTINGS){
-        const eventId = this.env.EVENT_SETTINGS.idFromName("global");
-        const eventStub = this.env.EVENT_SETTINGS.get(eventId);
-        const eventRes = await eventStub.fetch(new Request("https://internal/event", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "get" })
-        }));
-        const eventData = await eventRes.json();
-        eventEnabled = Boolean(eventData.enabled);
-        eventMonth = String(eventData.month || "");
-        eventCombos = Array.isArray(eventData.combos) ? eventData.combos : [];
-      }
-
-      const score = Math.max(0, Math.round(Number(body.score) || 0));
-      const name = sanitizeRankingName(body.name);
-
-      let activeEventMonth = eventEnabled && eventMonth === getCurrentMonthJST() && eventCombos.includes(`${mode}:${level}`);
-      if(body.__forceNormal){
-        activeEventMonth = false;
-      } else if(body.__forceEvent){
-        activeEventMonth = true;
-        eventMonth = String(body.__eventMonth || eventMonth);
-      }
-
-      if(activeEventMonth){
-        const session = await resolveUserSession(this.env, body.token);
-        if(!session){
-          return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
+        if(body.action === "getMonthRanking"){
+          const month = String(body.month || "");
+          const key = `monthScores:${month}`;
+          const monthScores = (await this.state.storage.get(key)) || [];
+          return new Response(JSON.stringify({ top20: stripSubs(monthScores) }), { headers: corsHeaders() });
         }
-        const key = `monthScores:${eventMonth}`;
-        const stored = (await this.state.storage.get(key)) || [];
-        const currentIndex = stored.findIndex(s => s.sub === session.sub);
-        let monthScores = stored;
-        let monthRank = null;
-        if(currentIndex === -1 || score > stored[currentIndex].score){
-          const others = stored.filter(s => s.sub !== session.sub);
-          let pos = 0;
-          while(pos < others.length && others[pos].score > score) pos++;
-          if(pos < RANKING_MAX){
-            others.splice(pos, 0, { score, name: session.name, sub: session.sub });
-            monthScores = others.slice(0, RANKING_MAX);
-            monthRank = pos + 1;
+
+        if(body.action === "clearMonthRanking"){
+          const month = String(body.month || "");
+          const key = `monthScores:${month}`;
+          await this.state.storage.put(key, []);
+          return new Response(JSON.stringify({ top20: [] }), { headers: corsHeaders() });
+        }
+
+        if(body.action === "deleteMonthRanking"){
+          const month = String(body.month || "");
+          const key = `monthScores:${month}`;
+          const monthScores = (await this.state.storage.get(key)) || [];
+          const target = Math.round(Number(body.score));
+          const idx = monthScores.findIndex(s => s.score === target);
+          if(idx !== -1){
+            monthScores.splice(idx, 1);
             await this.state.storage.put(key, monthScores);
           }
+          return new Response(JSON.stringify({ top20: stripSubs(monthScores) }), { headers: corsHeaders() });
         }
-        return new Response(JSON.stringify({ rank: monthRank, top20: stripSubs(monthScores), eventMode: true, month: eventMonth }), { headers: corsHeaders() });
-      }
 
-      let rank = null;
-      const existingIndex = this.scores.findIndex(s => s.score === score && s.name === name);
-      if(existingIndex !== -1){
-        rank = existingIndex < RANKING_MAX ? existingIndex + 1 : null;
-      } else {
-        let pos = 0;
-        while(pos < this.scores.length && this.scores[pos].score > score) pos++;
-        if(pos < RANKING_MAX){
-          this.scores.splice(pos, 0, { score, name });
-          if(this.scores.length > RANKING_MAX){
-            this.scores = this.scores.slice(0, RANKING_MAX);
+        if(body.action === "gameStart"){
+          const gameId = await this.startGame(String(body.ip || "unknown").slice(0, 64));
+          if(!gameId){
+            return this.jsonResponse({ error: "rate_limited" }, 429);
           }
-          rank = pos + 1;
-          await this.state.storage.put("scores", this.scores);
-        } else {
-          rank = null;
+          return this.jsonResponse({ gameId });
         }
+
+        if(body.action === "gameFinish"){
+          const out = await this.finishGame(mode, level, body);
+          if(out.error){
+            return this.jsonResponse({ error: out.error }, 400);
+          }
+          return this.jsonResponse({ ok: true, ...out.result });
+        }
+
+        if(body.action === "getVerifiedGame"){
+          const game = await this.getVerifiedGame(body.gameId);
+          return this.jsonResponse({ game });
+        }
+
+        return this.jsonResponse({ error: "unknown action" }, 400);
       }
 
-      return new Response(JSON.stringify({ rank, top20: this.scores }), { headers: corsHeaders() });
+      return this.submitScore(mode, level, body, internal);
     }
 
     return new Response("method not allowed", { status: 405, headers: corsHeaders() });
@@ -954,7 +1268,12 @@ export class UserAuth {
       if(!user){
         return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
       }
-      const { mode, level, score } = body;
+      const { mode, level, gameId } = body;
+      const verified = await fetchVerifiedGame(this.env, mode, level, gameId);
+      if(!verified){
+        return new Response(JSON.stringify({ error: "invalid_game" }), { status: 400, headers: corsHeaders() });
+      }
+      const score = verified.score;
       const key = `highScore_${mode}_${level}`;
       if(!user.highScores) user.highScores = {};
       const current = user.highScores[key] || 0;
@@ -1024,16 +1343,24 @@ export class UserAuth {
       if(!user){
         return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
       }
-      const record = {
-        mode: String(body.mode || ""),
-        level: String(body.level || ""),
-        playedAt: Date.now(),
-        accuracy: Number(body.accuracy) || 0,
-        speed: Number(body.speed) || 0,
-        miss: Number(body.miss) || 0,
-        score: Number(body.score) || 0
-      };
+      const verified = await fetchVerifiedGame(this.env, body.mode, body.level, body.gameId);
+      if(!verified){
+        return new Response(JSON.stringify({ error: "invalid_game" }), { status: 400, headers: corsHeaders() });
+      }
       if(!user.playRecords) user.playRecords = [];
+      if(user.playRecords.some(r => r.gameId === body.gameId)){
+        return new Response(JSON.stringify({ ok: true, playRecords: user.playRecords }), { headers: corsHeaders() });
+      }
+      const record = {
+        gameId: body.gameId,
+        mode: body.mode,
+        level: body.level,
+        playedAt: Date.now(),
+        accuracy: verified.accuracy,
+        speed: verified.speed,
+        miss: verified.miss,
+        score: verified.score
+      };
       user.playRecords.unshift(record);
       user.playRecords = user.playRecords.slice(0, PLAY_RECORD_MAX);
       await this.state.storage.put("users", this.users);
@@ -1365,7 +1692,7 @@ async function handleAuth(request, env){
     const res = await authStub.fetch(new Request("https://internal/auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "setHighScore", token: body.token, mode: body.mode, level: body.level, score: body.score })
+      body: JSON.stringify({ action: "setHighScore", token: body.token, mode: body.mode, level: body.level, gameId: body.gameId })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
@@ -1403,7 +1730,7 @@ async function handleAuth(request, env){
     const res = await authStub.fetch(new Request("https://internal/auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "addPlayRecord", token: body.token, mode: body.mode, level: body.level, accuracy: body.accuracy, speed: body.speed, miss: body.miss, score: body.score })
+      body: JSON.stringify({ action: "addPlayRecord", token: body.token, mode: body.mode, level: body.level, gameId: body.gameId })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
@@ -2570,6 +2897,17 @@ async function handleAdmin(request, env){
 export default {
   async fetch(request, env){
     const url = new URL(request.url);
+    const ip = getClientIp(request);
+
+    if(request.method !== "OPTIONS"){
+      const path = url.pathname;
+      if(path === "/auth" && rateLimited(`auth:${ip}`, 1000, 60000)) return tooManyRequests();
+      if(path === "/playlog" && rateLimited(`log:${ip}`, 1000, 60000)) return tooManyRequests();
+      if(path === "/presence" && rateLimited(`presence:${ip}`, 600, 60000)) return tooManyRequests();
+      if(path === "/ranking" && request.method === "POST" && rateLimited(`rank:${ip}`, 1000, 60000)) return tooManyRequests();
+      if(path.startsWith("/game/") && rateLimited(`game:${ip}`, 2000, 60000)) return tooManyRequests();
+      if((path === "/lobby" || path.startsWith("/friend/") || path.startsWith("/match/")) && rateLimited(`ws:${ip}`, 1000, 60000)) return tooManyRequests();
+    }
 
     if(url.pathname === "/admin"){
       return handleAdmin(request, env);
@@ -2623,6 +2961,12 @@ export default {
       const mode = url.searchParams.get("mode") || "hiragana";
       const level = url.searchParams.get("level") || "beginner";
       const force = url.searchParams.get("force") || "";
+      if(request.method === "OPTIONS"){
+        return new Response(null, { status: 204, headers: corsHeaders() });
+      }
+      if(!isValidModeLevel(mode, level)){
+        return new Response(JSON.stringify({ error: "invalid_mode" }), { status: 400, headers: corsHeaders() });
+      }
       const id = env.RANKING.idFromName(`${mode}:${level}`);
       const stub = env.RANKING.get(id);
 
@@ -2676,32 +3020,78 @@ export default {
         return new Response(JSON.stringify({ scores, eventMode: false, month: "" }), { headers: corsHeaders() });
       }
 
-      if(request.method === "POST" && (force === "event" || force === "normal")){
-        if(force === "event" && !eventActive){
-          return new Response(JSON.stringify({ error: "no_event" }), { status: 409, headers: corsHeaders() });
-        }
-        let body = {};
+      if(request.method === "POST"){
+        let body;
         try{
           body = await request.json();
         }catch(e){
           return new Response(JSON.stringify({ error: "invalid body" }), { status: 400, headers: corsHeaders() });
         }
-        const forwardBody = force === "event"
-          ? { ...body, __forceEvent: true, __eventMonth: eventMonth }
-          : { ...body, __forceNormal: true };
-        return stub.fetch(new Request(request.url, {
+        if(!body || typeof body !== "object" || Array.isArray(body) || body.action !== undefined){
+          return new Response(JSON.stringify({ error: "forbidden" }), { status: 403, headers: corsHeaders() });
+        }
+        const forwardBody = { gameId: body.gameId, name: body.name, token: body.token };
+        if(force === "event"){
+          if(!eventActive){
+            return new Response(JSON.stringify({ error: "no_event" }), { status: 409, headers: corsHeaders() });
+          }
+          forwardBody.__forceEvent = true;
+          forwardBody.__eventMonth = eventMonth;
+        } else if(force === "normal"){
+          forwardBody.__forceNormal = true;
+        }
+        return stub.fetch(new Request(`https://internal/ranking?mode=${mode}&level=${level}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(forwardBody)
         }));
       }
 
-      return stub.fetch(request);
+      return new Response("method not allowed", { status: 405, headers: corsHeaders() });
+    }
+
+    if(url.pathname === "/game/start" || url.pathname === "/game/finish"){
+      if(request.method === "OPTIONS"){
+        return new Response(null, { status: 204, headers: corsHeaders() });
+      }
+      if(request.method !== "POST"){
+        return new Response("method not allowed", { status: 405, headers: corsHeaders() });
+      }
+      const mode = url.searchParams.get("mode") || "";
+      const level = url.searchParams.get("level") || "";
+      if(!isValidModeLevel(mode, level)){
+        return new Response(JSON.stringify({ error: "invalid_mode" }), { status: 400, headers: corsHeaders() });
+      }
+      let payload;
+      if(url.pathname === "/game/start"){
+        payload = { action: "gameStart", ip };
+      } else {
+        let body;
+        try{
+          body = await request.json();
+        }catch(e){
+          return new Response(JSON.stringify({ error: "invalid body" }), { status: 400, headers: corsHeaders() });
+        }
+        if(!body || typeof body !== "object" || Array.isArray(body)){
+          return new Response(JSON.stringify({ error: "invalid body" }), { status: 400, headers: corsHeaders() });
+        }
+        payload = { action: "gameFinish", gameId: body.gameId, words: body.words, chars: body.chars, miss: body.miss, iv: body.iv };
+      }
+      const gameStub = env.RANKING.get(env.RANKING.idFromName(`${mode}:${level}`));
+      const gameRes = await gameStub.fetch(new Request(`https://internal/ranking?mode=${mode}&level=${level}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      }));
+      return new Response(await gameRes.text(), { status: gameRes.status, headers: corsHeaders() });
     }
 
     if(url.pathname === "/lobby"){
       const mode = url.searchParams.get("mode") || "hiragana";
       const level = url.searchParams.get("level") || "beginner";
+      if(!isValidModeLevel(mode, level)){
+        return new Response("bad request", { status: 400 });
+      }
       const id = env.LOBBY.idFromName(`${mode}:${level}`);
       const stub = env.LOBBY.get(id);
       return stub.fetch(request);
@@ -2712,7 +3102,7 @@ export default {
       if(!code){
         return new Response("missing room code", { status: 400 });
       }
-      if(!/^[0-9]+$/.test(code)){
+      if(!/^[0-9]{6}$/.test(code)){
         return new Response("invalid room code", { status: 400 });
       }
       const id = env.FRIEND_ROOM.idFromName(code);
@@ -2722,8 +3112,8 @@ export default {
 
     if(url.pathname.startsWith("/match/")){
       const matchId = url.pathname.split("/")[2];
-      if(!matchId){
-        return new Response("missing match id", { status: 400 });
+      if(!matchId || !UUID_RE.test(matchId)){
+        return new Response("invalid match id", { status: 400 });
       }
       const id = env.MATCH.idFromName(matchId);
       const stub = env.MATCH.get(id);
