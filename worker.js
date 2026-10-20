@@ -1511,6 +1511,7 @@ async function handlePlayLog(request, env){
 }
 
 const PRESENCE_ACTIVITIES = ["idle", "solo", "online", "friend", "matching"];
+const PRESENCE_PAGES = ["main", "event", "school"];
 const PRESENCE_MAX_CLIENTS = 2000;
 const PRESENCE_MAX_ADMINS = 10;
 const PRESENCE_STALE_MS = 150000;
@@ -1597,7 +1598,7 @@ export class Presence {
       const mode = active && RANKING_MODES.includes(msg.mode) ? msg.mode : "";
       const level = active && RANKING_LEVELS.includes(msg.level) ? msg.level : "";
       const name = sanitizeRankingName(msg.name);
-      const page = msg.page === "event" ? "event" : "main";
+      const page = PRESENCE_PAGES.includes(msg.page) ? msg.page : "main";
       if(entry.activity === activity && entry.mode === mode && entry.level === level && entry.name === name && entry.page === page) return;
       entry.page = page;
       entry.activity = activity;
