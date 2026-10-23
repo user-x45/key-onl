@@ -716,6 +716,36 @@ function getCurrentMonthJST(){
   return `${year}-${month}`;
 }
 
+function getCurrentWeekStartJST(){
+  const jst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  const start = new Date(Date.UTC(jst.getUTCFullYear(), jst.getUTCMonth(), jst.getUTCDate() - jst.getUTCDay()));
+  const year = start.getUTCFullYear();
+  const month = String(start.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(start.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+const RANKING_PERIODS = ["total", "week", "month"];
+
+function normalizePeriod(raw){
+  return RANKING_PERIODS.includes(raw) ? raw : "total";
+}
+
+function insertRankingScore(list, score, name){
+  const existingIndex = list.findIndex(s => s.score === score && s.name === name);
+  if(existingIndex !== -1){
+    return { list, rank: existingIndex < RANKING_MAX ? existingIndex + 1 : null, changed: false };
+  }
+  let pos = 0;
+  while(pos < list.length && list[pos].score > score) pos++;
+  if(pos >= RANKING_MAX){
+    return { list, rank: null, changed: false };
+  }
+  const next = list.slice();
+  next.splice(pos, 0, { score, name });
+  return { list: next.slice(0, RANKING_MAX), rank: pos + 1, changed: true };
+}
+
 function stripSubs(list){
   return list.map(({ sub, ...rest }) => rest);
 }
@@ -753,6 +783,47 @@ export class Ranking {
     this.scores = null;
     this.startLog = new Map();
     this.lastCleanup = 0;
+    this.prunedMarker = "";
+  }
+
+  periodStorageKey(period){
+    if(period === "week") return `rankWeek:${getCurrentWeekStartJST()}`;
+    if(period === "month") return `rankMonth:${getCurrentMonthJST()}`;
+    return null;
+  }
+
+  async getPeriodScores(period){
+    const key = this.periodStorageKey(period);
+    if(!key) return this.scores;
+    return (await this.state.storage.get(key)) || [];
+  }
+
+  async addPeriodScore(period, score, name){
+    const key = this.periodStorageKey(period);
+    const current = (await this.state.storage.get(key)) || [];
+    const out = insertRankingScore(current, score, name);
+    if(out.changed){
+      await this.state.storage.put(key, out.list);
+    }
+    return { rank: out.rank, top20: out.list };
+  }
+
+  async prunePeriodKeys(){
+    const week = this.periodStorageKey("week");
+    const month = this.periodStorageKey("month");
+    const marker = `${week}|${month}`;
+    if(this.prunedMarker === marker) return;
+    this.prunedMarker = marker;
+    const stale = [];
+    for(const prefix of ["rankWeek:", "rankMonth:"]){
+      const keys = await this.state.storage.list({ prefix });
+      for(const key of keys.keys()){
+        if(key !== week && key !== month) stale.push(key);
+      }
+    }
+    for(let i = 0; i < stale.length; i += 128){
+      await this.state.storage.delete(stale.slice(i, i + 128));
+    }
   }
 
   async load(){
@@ -940,7 +1011,16 @@ export class Ranking {
     }
 
     if(rec.usedNormal){
-      return this.jsonResponse({ rank: rec.normalRank || null, top20: this.scores, alreadySubmitted: true });
+      return this.jsonResponse({
+        rank: rec.normalRank || null,
+        top20: this.scores,
+        periods: {
+          total: { rank: rec.normalRank || null, top20: this.scores },
+          week: { rank: rec.weekRank || null, top20: await this.getPeriodScores("week") },
+          month: { rank: rec.monthRank || null, top20: await this.getPeriodScores("month") }
+        },
+        alreadySubmitted: true
+      });
     }
     rec.usedNormal = true;
     await this.state.storage.put(key, rec);
@@ -949,26 +1029,31 @@ export class Ranking {
     const nameCheck = await checkNameAllowed(this.env, name);
     if(!nameCheck.ok && nameCheck.error === "name_blocked") name = "GUEST";
 
-    let rank = null;
-    const existingIndex = this.scores.findIndex(s => s.score === score && s.name === name);
-    if(existingIndex !== -1){
-      rank = existingIndex < RANKING_MAX ? existingIndex + 1 : null;
-    } else {
-      let pos = 0;
-      while(pos < this.scores.length && this.scores[pos].score > score) pos++;
-      if(pos < RANKING_MAX){
-        this.scores.splice(pos, 0, { score, name });
-        if(this.scores.length > RANKING_MAX){
-          this.scores = this.scores.slice(0, RANKING_MAX);
-        }
-        rank = pos + 1;
-        await this.state.storage.put("scores", this.scores);
-      }
+    const totalOut = insertRankingScore(this.scores, score, name);
+    this.scores = totalOut.list;
+    if(totalOut.changed){
+      await this.state.storage.put("scores", this.scores);
     }
+    const rank = totalOut.rank;
+
+    await this.prunePeriodKeys();
+    const week = await this.addPeriodScore("week", score, name);
+    const month = await this.addPeriodScore("month", score, name);
+
     rec.normalRank = rank;
+    rec.weekRank = week.rank;
+    rec.monthRank = month.rank;
     await this.state.storage.put(key, rec);
 
-    return this.jsonResponse({ rank, top20: this.scores });
+    return this.jsonResponse({
+      rank,
+      top20: this.scores,
+      periods: {
+        total: { rank, top20: this.scores },
+        week,
+        month
+      }
+    });
   }
 
   async fetch(request){
@@ -984,7 +1069,8 @@ export class Ranking {
     await this.load();
 
     if(request.method === "GET"){
-      return new Response(JSON.stringify(this.scores), { headers: corsHeaders() });
+      const scores = await this.getPeriodScores(normalizePeriod(url.searchParams.get("period")));
+      return new Response(JSON.stringify(scores), { headers: corsHeaders() });
     }
 
     if(request.method === "POST"){
@@ -1004,19 +1090,35 @@ export class Ranking {
         }
 
         if(body.action === "clear"){
-          this.scores = [];
-          await this.state.storage.put("scores", this.scores);
-          return new Response(JSON.stringify({ top20: this.scores }), { headers: corsHeaders() });
+          const period = normalizePeriod(body.period);
+          if(period === "total"){
+            this.scores = [];
+            await this.state.storage.put("scores", this.scores);
+          } else {
+            await this.state.storage.put(this.periodStorageKey(period), []);
+          }
+          return new Response(JSON.stringify({ top20: await this.getPeriodScores(period) }), { headers: corsHeaders() });
         }
 
         if(body.action === "delete"){
+          const period = normalizePeriod(body.period);
           const target = Math.round(Number(body.score));
-          const idx = this.scores.findIndex(s => (typeof s === "object" && s !== null ? s.score : s) === target);
-          if(idx !== -1){
-            this.scores.splice(idx, 1);
-            await this.state.storage.put("scores", this.scores);
+          if(period === "total"){
+            const idx = this.scores.findIndex(s => (typeof s === "object" && s !== null ? s.score : s) === target);
+            if(idx !== -1){
+              this.scores.splice(idx, 1);
+              await this.state.storage.put("scores", this.scores);
+            }
+            return new Response(JSON.stringify({ top20: this.scores }), { headers: corsHeaders() });
           }
-          return new Response(JSON.stringify({ top20: this.scores }), { headers: corsHeaders() });
+          const periodKey = this.periodStorageKey(period);
+          const list = (await this.state.storage.get(periodKey)) || [];
+          const idx = list.findIndex(s => s.score === target);
+          if(idx !== -1){
+            list.splice(idx, 1);
+            await this.state.storage.put(periodKey, list);
+          }
+          return new Response(JSON.stringify({ top20: list }), { headers: corsHeaders() });
         }
 
         if(body.action === "getMonthRanking"){
@@ -2704,7 +2806,7 @@ async function handleAdmin(request, env){
       for(const level of RANKING_LEVELS){
         const id = env.RANKING.idFromName(`${mode}:${level}`);
         const stub = env.RANKING.get(id);
-        const res = await stub.fetch(new Request("https://internal/ranking", { method: "GET" }));
+        const res = await stub.fetch(new Request(`https://internal/ranking?period=${normalizePeriod(body.period)}`, { method: "GET" }));
         result[`${mode}:${level}`] = await res.json();
       }
     }
@@ -2718,7 +2820,7 @@ async function handleAdmin(request, env){
     const res = await stub.fetch(new Request("https://internal/ranking", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "delete", score })
+      body: JSON.stringify({ action: "delete", score, period: body.period })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
@@ -2730,7 +2832,7 @@ async function handleAdmin(request, env){
     const res = await stub.fetch(new Request("https://internal/ranking", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "clear" })
+      body: JSON.stringify({ action: "clear", period: body.period })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
