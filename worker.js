@@ -1,15 +1,26 @@
 const WORDS_BASE_URL = "https://s-typing.f5.si/words";
-const wordListCache = {};
+const WORD_LIST_TTL_MS = 3600000;
+const rawWordLists = {};
+
+async function fetchRawWordList(key){
+  const cached = rawWordLists[key];
+  if(cached && Date.now() - cached.at < WORD_LIST_TTL_MS) return cached.list;
+  try{
+    const res = await fetch(`${WORDS_BASE_URL}/${key}.json`, { cf: { cacheTtl: 3600, cacheEverything: true } });
+    if(!res.ok) throw new Error("fetch failed");
+    const list = await res.json();
+    rawWordLists[key] = { list, at: Date.now() };
+    return list;
+  }catch(e){
+    if(cached) return cached.list;
+    throw e;
+  }
+}
 
 async function fetchWordList(mode, level){
   const cacheKey = `${mode}-${level}`;
-  if(wordListCache[cacheKey]) return wordListCache[cacheKey];
   try{
-    const res = await fetch(`${WORDS_BASE_URL}/${cacheKey}.json`);
-    if(!res.ok) throw new Error("fetch failed");
-    const list = await res.json();
-    wordListCache[cacheKey] = list;
-    return list;
+    return await fetchRawWordList(cacheKey);
   }catch(e){
     if(cacheKey !== "hiragana-beginner"){
       return fetchWordList("hiragana", "beginner");
@@ -80,6 +91,23 @@ function rateLimited(key, max, windowMs){
   return false;
 }
 
+const EVENT_CACHE_TTL_MS = 15000;
+let eventCache = null;
+
+async function getEventSettings(env){
+  if(!env.EVENT_SETTINGS) return { enabled: false, month: "", combos: [], notice: "" };
+  if(eventCache && Date.now() - eventCache.at < EVENT_CACHE_TTL_MS) return eventCache.data;
+  const stub = env.EVENT_SETTINGS.get(env.EVENT_SETTINGS.idFromName("global"));
+  const res = await stub.fetch(new Request("https://internal/event", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "get" })
+  }));
+  const data = await res.json();
+  eventCache = { data, at: Date.now() };
+  return data;
+}
+
 function tooManyRequests(){
   return new Response(JSON.stringify({ error: "rate_limited" }), { status: 429, headers: corsHeaders() });
 }
@@ -89,9 +117,7 @@ async function getWordBounds(mode, level){
   const cached = wordBoundsCache[key];
   if(cached && Date.now() - cached.at < WORD_BOUNDS_TTL_MS) return cached.bounds;
   try{
-    const res = await fetch(`${WORDS_BASE_URL}/${key}.json`);
-    if(!res.ok) return cached ? cached.bounds : null;
-    const list = await res.json();
+    const list = await fetchRawWordList(key);
     if(!Array.isArray(list) || list.length === 0) return null;
     let min = Infinity;
     let max = 0;
@@ -396,16 +422,21 @@ export class FriendRegistry {
 
   pruneExpired(){
     const now = Date.now();
+    let changed = false;
     for(const code of Object.keys(this.codes)){
       if(this.codes[code].expiresAt < now){
         delete this.codes[code];
+        changed = true;
       }
     }
+    return changed;
   }
 
   async fetch(request){
     await this.load();
-    this.pruneExpired();
+    if(this.pruneExpired()){
+      await this.state.storage.put("codes", this.codes);
+    }
 
     let body = {};
     try{
@@ -433,7 +464,6 @@ export class FriendRegistry {
     }
 
     if(body.action === "list"){
-      await this.state.storage.put("codes", this.codes);
       const list = Object.keys(this.codes).map(code => ({ code, ...this.codes[code] }));
       list.sort((a, b) => b.createdAt - a.createdAt);
       return new Response(JSON.stringify({ codes: list }), { headers: corsHeaders() });
@@ -838,7 +868,7 @@ export class Ranking {
   }
 
   async cleanupGames(now){
-    if(now - this.lastCleanup < 60000) return;
+    if(now - this.lastCleanup < 300000) return;
     this.lastCleanup = now;
     const games = await this.state.storage.list({ prefix: "g:", limit: 1000 });
     const expired = [];
@@ -942,22 +972,10 @@ export class Ranking {
       return this.jsonResponse({ error: "game_required" }, 400);
     }
 
-    let eventEnabled = false;
-    let eventMonth = "";
-    let eventCombos = [];
-    if(this.env.EVENT_SETTINGS){
-      const eventId = this.env.EVENT_SETTINGS.idFromName("global");
-      const eventStub = this.env.EVENT_SETTINGS.get(eventId);
-      const eventRes = await eventStub.fetch(new Request("https://internal/event", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "get" })
-      }));
-      const eventData = await eventRes.json();
-      eventEnabled = Boolean(eventData.enabled);
-      eventMonth = String(eventData.month || "");
-      eventCombos = Array.isArray(eventData.combos) ? eventData.combos : [];
-    }
+    const eventData = await getEventSettings(this.env);
+    let eventEnabled = Boolean(eventData.enabled);
+    let eventMonth = String(eventData.month || "");
+    const eventCombos = Array.isArray(eventData.combos) ? eventData.combos : [];
 
     let activeEventMonth = eventEnabled && eventMonth === getCurrentMonthJST() && eventCombos.includes(`${mode}:${level}`);
     if(internal && body.__forceNormal){
@@ -1859,26 +1877,52 @@ async function handleAuth(request, env){
 }
 
 const PLAY_LOG_MAX = 500;
+const PLAY_LOG_PRUNE_EVERY = 50;
 
 export class PlayLog {
   constructor(state, env){
     this.state = state;
     this.env = env;
-    this.entries = null;
+    this.migrated = false;
+    this.sinceLastPrune = 0;
+    this.seq = 0;
   }
 
-  async load(){
-    if(this.entries) return;
-    const stored = await this.state.storage.get("entries");
-    this.entries = Array.isArray(stored) ? stored : [];
+  async migrate(){
+    if(this.migrated) return;
+    this.migrated = true;
+    const legacy = await this.state.storage.get("entries");
+    if(!Array.isArray(legacy)) return;
+    const base = Date.now();
+    for(let i = 0; i < legacy.length; i += 128){
+      const batch = {};
+      legacy.slice(i, i + 128).forEach((entry, j) => {
+        const order = legacy.length - (i + j);
+        batch[`e:${String(entry.ts || base).padStart(15, "0")}:${String(order).padStart(6, "0")}`] = entry;
+      });
+      await this.state.storage.put(batch);
+    }
+    await this.state.storage.delete("entries");
+  }
+
+  entryKey(){
+    this.seq = (this.seq + 1) % 1000000;
+    return `e:${String(Date.now()).padStart(15, "0")}:${String(this.seq).padStart(6, "0")}${crypto.randomUUID().slice(0, 4)}`;
+  }
+
+  async prune(){
+    const keys = await this.state.storage.list({ prefix: "e:", reverse: true, limit: PLAY_LOG_MAX + PLAY_LOG_PRUNE_EVERY * 2, allowConcurrency: true });
+    const all = Array.from(keys.keys());
+    const stale = all.slice(PLAY_LOG_MAX);
+    for(let i = 0; i < stale.length; i += 128){
+      await this.state.storage.delete(stale.slice(i, i + 128));
+    }
   }
 
   async fetch(request){
     if(request.method === "OPTIONS"){
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
-
-    await this.load();
 
     let body = {};
     try{
@@ -1888,6 +1932,7 @@ export class PlayLog {
     }
 
     if(body.action === "record"){
+      await this.migrate();
       const name = sanitizeRankingName(body.name);
       const mode = String(body.mode || "");
       const level = String(body.level || "");
@@ -1895,21 +1940,24 @@ export class PlayLog {
       const opponent = String(body.opponent || "").trim().slice(0, 6);
       const ip = String(body.ip || "unknown").slice(0, 64);
       const userAgent = String(body.userAgent || "unknown").slice(0, 300);
-      this.entries.unshift({ name, mode, level, matchType, opponent, ip, userAgent, ts: Date.now() });
-      if(this.entries.length > PLAY_LOG_MAX){
-        this.entries = this.entries.slice(0, PLAY_LOG_MAX);
+      await this.state.storage.put(this.entryKey(), { name, mode, level, matchType, opponent, ip, userAgent, ts: Date.now() });
+      this.sinceLastPrune += 1;
+      if(this.sinceLastPrune >= PLAY_LOG_PRUNE_EVERY){
+        this.sinceLastPrune = 0;
+        await this.prune();
       }
-      await this.state.storage.put("entries", this.entries);
       return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
     }
 
     if(body.action === "list"){
-      return new Response(JSON.stringify({ entries: this.entries }), { headers: corsHeaders() });
+      await this.migrate();
+      const map = await this.state.storage.list({ prefix: "e:", reverse: true, limit: PLAY_LOG_MAX });
+      return new Response(JSON.stringify({ entries: Array.from(map.values()) }), { headers: corsHeaders() });
     }
 
     if(body.action === "clear"){
-      this.entries = [];
-      await this.state.storage.put("entries", this.entries);
+      this.migrated = true;
+      await this.state.storage.deleteAll();
       return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders() });
     }
 
@@ -1943,9 +1991,6 @@ const PRESENCE_ACTIVITIES = ["idle", "solo", "online", "friend", "matching"];
 const PRESENCE_PAGES = ["main", "event", "school"];
 const PRESENCE_MAX_CLIENTS = 2000;
 const PRESENCE_MAX_ADMINS = 10;
-const PRESENCE_STALE_MS = 150000;
-const PRESENCE_TICK_MS = 5000;
-const PRESENCE_HEARTBEAT_MS = 25000;
 const PRESENCE_ADMIN_RECHECK_MS = 60000;
 const PRESENCE_BROADCAST_MIN_MS = 1000;
 const PRESENCE_MESSAGE_MAX = 512;
@@ -1954,12 +1999,9 @@ export class Presence {
   constructor(state, env){
     this.state = state;
     this.env = env;
-    this.clients = new Map();
-    this.admins = new Map();
-    this.nextId = 1;
     this.lastBroadcastAt = 0;
     this.broadcastTimer = null;
-    this.tickTimer = null;
+    this.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
   async fetch(request){
@@ -1973,101 +2015,91 @@ export class Presence {
       return new Response("expected websocket", { status: 426 });
     }
 
-    if(url.pathname === "/admin-presence"){
-      if(this.admins.size >= PRESENCE_MAX_ADMINS){
-        return new Response("too many admin connections", { status: 503 });
-      }
-      const adminPair = new WebSocketPair();
-      const [adminClient, adminServer] = Object.values(adminPair);
-      adminServer.accept();
-      this.attachAdmin(adminServer, request);
-      return new Response(null, { status: 101, webSocket: adminClient, headers: { "Sec-WebSocket-Protocol": "admin-presence" } });
-    }
-
-    if(this.clients.size >= PRESENCE_MAX_CLIENTS){
-      return new Response("too many connections", { status: 503 });
-    }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
-    server.accept();
-    this.attachClient(server, request);
-    return new Response(null, { status: 101, webSocket: client });
-  }
 
-  attachClient(ws, request){
+    if(url.pathname === "/admin-presence"){
+      if(this.state.getWebSockets("admin").length >= PRESENCE_MAX_ADMINS){
+        return new Response("too many admin connections", { status: 503 });
+      }
+      const protocols = String(request.headers.get("Sec-WebSocket-Protocol") || "").split(",").map(p => p.trim());
+      this.state.acceptWebSocket(server, ["admin"]);
+      server.serializeAttachment({ kind: "admin", token: protocols[1] || "", lastCheck: Date.now() });
+      try{
+        server.send(JSON.stringify(this.buildSnapshot()));
+      }catch(e){}
+      await this.scheduleAdminRecheck();
+      return new Response(null, { status: 101, webSocket: client, headers: { "Sec-WebSocket-Protocol": "admin-presence" } });
+    }
+
+    if(this.state.getWebSockets("client").length >= PRESENCE_MAX_CLIENTS){
+      return new Response("too many connections", { status: 503 });
+    }
     const now = Date.now();
-    const entry = {
-      id: this.nextId++,
+    this.state.acceptWebSocket(server, ["client"]);
+    server.serializeAttachment({
+      kind: "client",
+      id: Math.floor(Math.random() * 1000000000),
       ip: String(request.headers.get("CF-Connecting-IP") || "unknown").slice(0, 64),
       userAgent: String(request.headers.get("User-Agent") || "unknown").slice(0, 300),
       connectedAt: now,
-      lastSeen: now,
       activity: "idle",
       mode: "",
       level: "",
       name: "GUEST",
       page: "main"
-    };
-    this.clients.set(ws, entry);
-    this.ensureTick();
-    this.scheduleBroadcast();
-
-    ws.addEventListener("message", (event) => {
-      entry.lastSeen = Date.now();
-      if(typeof event.data !== "string" || event.data.length > PRESENCE_MESSAGE_MAX) return;
-      let msg;
-      try{
-        msg = JSON.parse(event.data);
-      }catch(e){
-        return;
-      }
-      if(!msg || msg.type !== "state") return;
-      const activity = PRESENCE_ACTIVITIES.includes(msg.activity) ? msg.activity : "idle";
-      const active = activity !== "idle";
-      const mode = active && RANKING_MODES.includes(msg.mode) ? msg.mode : "";
-      const level = active && RANKING_LEVELS.includes(msg.level) ? msg.level : "";
-      const name = sanitizeRankingName(msg.name);
-      const page = PRESENCE_PAGES.includes(msg.page) ? msg.page : "main";
-      if(entry.activity === activity && entry.mode === mode && entry.level === level && entry.name === name && entry.page === page) return;
-      entry.page = page;
-      entry.activity = activity;
-      entry.mode = mode;
-      entry.level = level;
-      entry.name = name;
-      this.scheduleBroadcast();
     });
-
-    const drop = () => this.dropClient(ws);
-    ws.addEventListener("close", drop);
-    ws.addEventListener("error", drop);
-  }
-
-  attachAdmin(ws, request){
-    const protocols = String(request.headers.get("Sec-WebSocket-Protocol") || "").split(",").map(p => p.trim());
-    this.admins.set(ws, { token: protocols[1] || "", lastCheck: Date.now() });
-    this.ensureTick();
-    try{
-      ws.send(JSON.stringify(this.buildSnapshot()));
-    }catch(e){}
-
-    const drop = () => {
-      this.admins.delete(ws);
-      this.stopTickIfIdle();
-    };
-    ws.addEventListener("close", drop);
-    ws.addEventListener("error", drop);
-  }
-
-  dropClient(ws){
-    if(!this.clients.delete(ws)) return;
     this.scheduleBroadcast();
-    this.stopTickIfIdle();
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  webSocketMessage(ws, data){
+    if(typeof data !== "string" || data.length > PRESENCE_MESSAGE_MAX) return;
+    const entry = ws.deserializeAttachment();
+    if(!entry || entry.kind !== "client") return;
+    let msg;
+    try{
+      msg = JSON.parse(data);
+    }catch(e){
+      return;
+    }
+    if(!msg || msg.type !== "state") return;
+    const activity = PRESENCE_ACTIVITIES.includes(msg.activity) ? msg.activity : "idle";
+    const active = activity !== "idle";
+    const mode = active && RANKING_MODES.includes(msg.mode) ? msg.mode : "";
+    const level = active && RANKING_LEVELS.includes(msg.level) ? msg.level : "";
+    const name = sanitizeRankingName(msg.name);
+    const page = PRESENCE_PAGES.includes(msg.page) ? msg.page : "main";
+    if(entry.activity === activity && entry.mode === mode && entry.level === level && entry.name === name && entry.page === page) return;
+    entry.activity = activity;
+    entry.mode = mode;
+    entry.level = level;
+    entry.name = name;
+    entry.page = page;
+    ws.serializeAttachment(entry);
+    this.scheduleBroadcast();
+  }
+
+  webSocketClose(ws, code, reason, wasClean){
+    try{
+      ws.close(code === 1005 || code === 1006 ? 1000 : code, "closed");
+    }catch(e){}
+    this.scheduleBroadcast();
+  }
+
+  webSocketError(ws){
+    try{
+      ws.close(1011, "error");
+    }catch(e){}
+    this.scheduleBroadcast();
   }
 
   buildSnapshot(){
     const now = Date.now();
     const clients = [];
-    for(const entry of this.clients.values()){
+    for(const ws of this.state.getWebSockets("client")){
+      const entry = ws.deserializeAttachment();
+      if(!entry) continue;
       clients.push({
         id: entry.id,
         name: entry.name,
@@ -2084,7 +2116,8 @@ export class Presence {
   }
 
   scheduleBroadcast(){
-    if(this.admins.size === 0 || this.broadcastTimer) return;
+    if(this.broadcastTimer) return;
+    if(this.state.getWebSockets("admin").length === 0) return;
     const wait = Math.max(0, this.lastBroadcastAt + PRESENCE_BROADCAST_MIN_MS - Date.now());
     this.broadcastTimer = setTimeout(() => {
       this.broadcastTimer = null;
@@ -2094,45 +2127,37 @@ export class Presence {
 
   broadcast(){
     this.lastBroadcastAt = Date.now();
-    if(this.admins.size === 0) return;
+    const admins = this.state.getWebSockets("admin");
+    if(admins.length === 0) return;
     const payload = JSON.stringify(this.buildSnapshot());
-    for(const ws of this.admins.keys()){
+    for(const ws of admins){
       try{
         ws.send(payload);
       }catch(e){}
     }
   }
 
-  ensureTick(){
-    if(this.tickTimer) return;
-    this.tickTimer = setInterval(() => this.tick(), PRESENCE_TICK_MS);
-  }
-
-  stopTickIfIdle(){
-    if(this.tickTimer && this.clients.size === 0 && this.admins.size === 0){
-      clearInterval(this.tickTimer);
-      this.tickTimer = null;
+  async scheduleAdminRecheck(){
+    const current = await this.state.storage.getAlarm();
+    if(current === null){
+      await this.state.storage.setAlarm(Date.now() + PRESENCE_ADMIN_RECHECK_MS);
     }
   }
 
-  tick(){
+  async alarm(){
+    const admins = this.state.getWebSockets("admin");
+    if(admins.length === 0) return;
     const now = Date.now();
-    for(const [ws, entry] of this.clients){
-      if(now - entry.lastSeen > PRESENCE_STALE_MS){
-        this.dropClient(ws);
-        try{
-          ws.close(1001, "stale");
-        }catch(e){}
-      }
+    for(const ws of admins){
+      const admin = ws.deserializeAttachment();
+      if(!admin) continue;
+      if(now - admin.lastCheck < PRESENCE_ADMIN_RECHECK_MS) continue;
+      admin.lastCheck = now;
+      ws.serializeAttachment(admin);
+      await this.recheckAdmin(ws, admin);
     }
-    for(const [ws, admin] of this.admins){
-      if(now - admin.lastCheck >= PRESENCE_ADMIN_RECHECK_MS){
-        admin.lastCheck = now;
-        this.recheckAdmin(ws, admin);
-      }
-    }
-    if(this.admins.size > 0 && now - this.lastBroadcastAt >= PRESENCE_HEARTBEAT_MS){
-      this.scheduleBroadcast();
+    if(this.state.getWebSockets("admin").length > 0){
+      await this.state.storage.setAlarm(Date.now() + PRESENCE_ADMIN_RECHECK_MS);
     }
   }
 
@@ -2146,11 +2171,9 @@ export class Presence {
       return;
     }
     if(valid) return;
-    this.admins.delete(ws);
     try{
       ws.close(4401, "unauthorized");
     }catch(e){}
-    this.stopTickIfIdle();
   }
 }
 
@@ -2481,7 +2504,6 @@ export class AdminAuth {
 
     if(body.action === "verify"){
       const valid = Boolean(body.token && this.tokens[body.token] && this.tokens[body.token] >= Date.now());
-      await this.state.storage.put("tokens", this.tokens);
       return new Response(JSON.stringify({ valid }), { headers: corsHeaders() });
     }
 
@@ -2849,6 +2871,7 @@ async function handleAdmin(request, env){
   }
 
   if(body.action === "setEventMode"){
+    eventCache = null;
     const { enabled, month, combos, notice } = body;
     const eventId = env.EVENT_SETTINGS.idFromName("global");
     const eventStub = env.EVENT_SETTINGS.get(eventId);
@@ -2857,6 +2880,7 @@ async function handleAdmin(request, env){
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action: "set", enabled, month, combos, notice })
     }));
+    eventCache = null;
     return new Response(await res.text(), { headers: corsHeaders() });
   }
 
@@ -2996,8 +3020,9 @@ async function handleAdmin(request, env){
   return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
 }
 
-export default {
-  async fetch(request, env){
+const RANKING_EDGE_TTL_SECONDS = 10;
+
+async function route(request, env){
     const url = new URL(request.url);
     const ip = getClientIp(request);
 
@@ -3019,17 +3044,7 @@ export default {
       if(request.method === "OPTIONS"){
         return new Response(null, { status: 204, headers: corsHeaders() });
       }
-      if(!env.EVENT_SETTINGS){
-        return new Response(JSON.stringify({ enabled: false, month: "", combos: [], notice: "" }), { headers: corsHeaders() });
-      }
-      const eventId = env.EVENT_SETTINGS.idFromName("global");
-      const eventStub = env.EVENT_SETTINGS.get(eventId);
-      const eventRes = await eventStub.fetch(new Request("https://internal/event", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "get" })
-      }));
-      const eventData = await eventRes.json();
+      const eventData = await getEventSettings(env);
       const enabled = Boolean(eventData.enabled) && String(eventData.month || "") === getCurrentMonthJST();
       return new Response(JSON.stringify({
         enabled,
@@ -3072,22 +3087,10 @@ export default {
       const id = env.RANKING.idFromName(`${mode}:${level}`);
       const stub = env.RANKING.get(id);
 
-      let eventEnabled = false;
-      let eventMonth = "";
-      let eventCombos = [];
-      if(env.EVENT_SETTINGS){
-        const eventId = env.EVENT_SETTINGS.idFromName("global");
-        const eventStub = env.EVENT_SETTINGS.get(eventId);
-        const eventRes = await eventStub.fetch(new Request("https://internal/event", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "get" })
-        }));
-        const eventData = await eventRes.json();
-        eventEnabled = Boolean(eventData.enabled);
-        eventMonth = String(eventData.month || "");
-        eventCombos = Array.isArray(eventData.combos) ? eventData.combos : [];
-      }
+      const eventData = await getEventSettings(env);
+      const eventEnabled = Boolean(eventData.enabled);
+      const eventMonth = String(eventData.month || "");
+      const eventCombos = Array.isArray(eventData.combos) ? eventData.combos : [];
       const eventActive = eventEnabled && eventMonth === getCurrentMonthJST() && eventCombos.includes(`${mode}:${level}`);
 
       if(request.method === "GET"){
@@ -3223,5 +3226,35 @@ export default {
     }
 
     return new Response("not found", { status: 404 });
+}
+
+export default {
+  async fetch(request, env, ctx){
+    const url = new URL(request.url);
+    if(request.method === "GET" && url.pathname === "/ranking"){
+      const cache = caches.default;
+      const cacheKey = new Request(url.toString(), { method: "GET" });
+      const hit = await cache.match(cacheKey);
+      if(hit) return hit;
+      const res = await route(request, env);
+      if(res.status === 200){
+        const headers = new Headers(res.headers);
+        headers.set("Cache-Control", `public, max-age=0, s-maxage=${RANKING_EDGE_TTL_SECONDS}`);
+        const cached = new Response(await res.text(), { status: 200, headers });
+        ctx.waitUntil(cache.put(cacheKey, cached.clone()));
+        return cached;
+      }
+      return res;
+    }
+    if(request.method === "GET" && url.pathname === "/event-status"){
+      const res = await route(request, env);
+      if(res.status === 200){
+        const headers = new Headers(res.headers);
+        headers.set("Cache-Control", "public, max-age=15");
+        return new Response(await res.text(), { status: 200, headers });
+      }
+      return res;
+    }
+    return route(request, env);
   }
 };
