@@ -1915,15 +1915,37 @@ export class PlayLog {
   }
 
   async lookupGeo(ip){
-    try{
-      const res = await fetch(`https://ipwho.is/${encodeURIComponent(ip)}?lang=ja&fields=success,country_code,region,city`, { signal: AbortSignal.timeout(3000) });
-      if(!res.ok) return null;
-      const data = await res.json();
-      if(!data || data.success !== true) return null;
-      return sanitizeGeo({ country: data.country_code, region: data.region, city: data.city });
-    }catch(e){
-      return null;
+    if(!/^[0-9a-fA-F:.]+$/.test(ip)) return null;
+    const providers = [
+      async () => {
+        const res = await fetch(`https://ipwho.is/${ip}?lang=ja`, { signal: AbortSignal.timeout(3000) });
+        if(!res.ok) return null;
+        const data = await res.json();
+        if(!data || data.success !== true) return null;
+        return { country: data.country_code, region: data.region, city: data.city };
+      },
+      async () => {
+        const res = await fetch(`https://ipapi.co/${ip}/json/`, { signal: AbortSignal.timeout(3000) });
+        if(!res.ok) return null;
+        const data = await res.json();
+        if(!data || data.error) return null;
+        return { country: data.country_code, region: data.region, city: data.city };
+      },
+      async () => {
+        const res = await fetch(`http://ip-api.com/json/${ip}?lang=ja&fields=status,countryCode,regionName,city`, { signal: AbortSignal.timeout(3000) });
+        if(!res.ok) return null;
+        const data = await res.json();
+        if(!data || data.status !== "success") return null;
+        return { country: data.countryCode, region: data.regionName, city: data.city };
+      }
+    ];
+    for(const provider of providers){
+      try{
+        const geo = await provider();
+        if(geo && geo.country) return sanitizeGeo(geo);
+      }catch(e){}
     }
+    return null;
   }
 
   async fillMissingGeo(entries){
