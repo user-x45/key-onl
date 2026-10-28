@@ -755,9 +755,24 @@ function getCurrentWeekStartJST(){
   return `${year}-${month}-${day}`;
 }
 
-const RANKING_PERIODS = ["total", "week", "month"];
+const RANKING_TODAY_START = "2026-10-29";
+
+function getTodayJST(){
+  const jst = new Date(Date.now() + 9 * 60 * 60 * 1000);
+  const year = jst.getUTCFullYear();
+  const month = String(jst.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(jst.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function isTodayRankingActive(){
+  return getTodayJST() >= RANKING_TODAY_START;
+}
+
+const RANKING_PERIODS = ["total", "week", "month", "today"];
 
 function normalizePeriod(raw){
+  if(raw === "today") return isTodayRankingActive() ? "today" : "total";
   return RANKING_PERIODS.includes(raw) ? raw : "total";
 }
 
@@ -819,10 +834,12 @@ export class Ranking {
   periodStorageKey(period){
     if(period === "week") return `rankWeek:${getCurrentWeekStartJST()}`;
     if(period === "month") return `rankMonth:${getCurrentMonthJST()}`;
+    if(period === "today") return `rankDay:${getTodayJST()}`;
     return null;
   }
 
   async getPeriodScores(period){
+    if(period === "today" && !isTodayRankingActive()) return [];
     const key = this.periodStorageKey(period);
     if(!key) return this.scores;
     return (await this.state.storage.get(key)) || [];
@@ -841,14 +858,15 @@ export class Ranking {
   async prunePeriodKeys(){
     const week = this.periodStorageKey("week");
     const month = this.periodStorageKey("month");
-    const marker = `${week}|${month}`;
+    const day = this.periodStorageKey("today");
+    const marker = `${week}|${month}|${day}`;
     if(this.prunedMarker === marker) return;
     this.prunedMarker = marker;
     const stale = [];
-    for(const prefix of ["rankWeek:", "rankMonth:"]){
+    for(const prefix of ["rankWeek:", "rankMonth:", "rankDay:"]){
       const keys = await this.state.storage.list({ prefix });
       for(const key of keys.keys()){
-        if(key !== week && key !== month) stale.push(key);
+        if(key !== week && key !== month && key !== day) stale.push(key);
       }
     }
     for(let i = 0; i < stale.length; i += 128){
@@ -1035,7 +1053,8 @@ export class Ranking {
         periods: {
           total: { rank: rec.normalRank || null, top20: this.scores },
           week: { rank: rec.weekRank || null, top20: await this.getPeriodScores("week") },
-          month: { rank: rec.monthRank || null, top20: await this.getPeriodScores("month") }
+          month: { rank: rec.monthRank || null, top20: await this.getPeriodScores("month") },
+          ...(isTodayRankingActive() ? { today: { rank: rec.todayRank || null, top20: await this.getPeriodScores("today") } } : {})
         },
         alreadySubmitted: true
       });
@@ -1057,10 +1076,12 @@ export class Ranking {
     await this.prunePeriodKeys();
     const week = await this.addPeriodScore("week", score, name);
     const month = await this.addPeriodScore("month", score, name);
+    const today = isTodayRankingActive() ? await this.addPeriodScore("today", score, name) : null;
 
     rec.normalRank = rank;
     rec.weekRank = week.rank;
     rec.monthRank = month.rank;
+    if(today) rec.todayRank = today.rank;
     await this.state.storage.put(key, rec);
 
     return this.jsonResponse({
@@ -1069,7 +1090,8 @@ export class Ranking {
       periods: {
         total: { rank, top20: this.scores },
         week,
-        month
+        month,
+        ...(today ? { today } : {})
       }
     });
   }
@@ -1105,6 +1127,10 @@ export class Ranking {
       if(body.action !== undefined){
         if(!internal){
           return this.jsonResponse({ error: "forbidden" }, 403);
+        }
+
+        if((body.action === "clear" || body.action === "delete") && body.period === "today" && !isTodayRankingActive()){
+          return new Response(JSON.stringify({ top20: [] }), { headers: corsHeaders() });
         }
 
         if(body.action === "clear"){
