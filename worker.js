@@ -1922,21 +1922,21 @@ export class PlayLog {
         if(!res.ok) return null;
         const data = await res.json();
         if(!data || data.success !== true) return null;
-        return { country: data.country_code, region: data.region, city: data.city };
+        return { country: data.country_code, region: data.region, city: data.city, source: "ipwho.is" };
       },
       async () => {
         const res = await fetch(`https://ipapi.co/${ip}/json/`, { signal: AbortSignal.timeout(3000) });
         if(!res.ok) return null;
         const data = await res.json();
         if(!data || data.error) return null;
-        return { country: data.country_code, region: data.region, city: data.city };
+        return { country: data.country_code, region: data.region, city: data.city, source: "ipapi.co" };
       },
       async () => {
         const res = await fetch(`http://ip-api.com/json/${ip}?lang=ja&fields=status,countryCode,regionName,city`, { signal: AbortSignal.timeout(3000) });
         if(!res.ok) return null;
         const data = await res.json();
         if(!data || data.status !== "success") return null;
-        return { country: data.countryCode, region: data.regionName, city: data.city };
+        return { country: data.countryCode, region: data.regionName, city: data.city, source: "ip-api.com" };
       }
     ];
     for(const provider of providers){
@@ -2060,7 +2060,8 @@ function getRequestGeo(request){
   return {
     country: String(cf.country || "").slice(0, 8),
     region: String(cf.region || "").slice(0, 64),
-    city: String(cf.city || "").slice(0, 64)
+    city: String(cf.city || "").slice(0, 64),
+    source: "Cloudflare"
   };
 }
 
@@ -2069,7 +2070,8 @@ function sanitizeGeo(geo){
   return {
     country: String(g.country || "").slice(0, 8),
     region: String(g.region || "").slice(0, 64),
-    city: String(g.city || "").slice(0, 64)
+    city: String(g.city || "").slice(0, 64),
+    source: String(g.source || "").slice(0, 32)
   };
 }
 
