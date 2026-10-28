@@ -1914,67 +1914,6 @@ export class PlayLog {
     this.seq = 0;
   }
 
-  async lookupGeo(ip){
-    if(!/^[0-9a-fA-F:.]+$/.test(ip)) return null;
-    const providers = [
-      async () => {
-        const res = await fetch(`https://ipwho.is/${ip}?lang=ja`, { signal: AbortSignal.timeout(3000) });
-        if(!res.ok) return null;
-        const data = await res.json();
-        if(!data || data.success !== true) return null;
-        return { country: data.country_code, region: data.region, city: data.city, source: "ipwho.is" };
-      },
-      async () => {
-        const res = await fetch(`https://ipapi.co/${ip}/json/`, { signal: AbortSignal.timeout(3000) });
-        if(!res.ok) return null;
-        const data = await res.json();
-        if(!data || data.error) return null;
-        return { country: data.country_code, region: data.region, city: data.city, source: "ipapi.co" };
-      },
-      async () => {
-        const res = await fetch(`http://ip-api.com/json/${ip}?lang=ja&fields=status,countryCode,regionName,city`, { signal: AbortSignal.timeout(3000) });
-        if(!res.ok) return null;
-        const data = await res.json();
-        if(!data || data.status !== "success") return null;
-        return { country: data.countryCode, region: data.regionName, city: data.city, source: "ip-api.com" };
-      }
-    ];
-    for(const provider of providers){
-      try{
-        const geo = await provider();
-        if(geo && geo.country) return sanitizeGeo(geo);
-      }catch(e){}
-    }
-    return null;
-  }
-
-  async fillMissingGeo(entries){
-    const targets = [];
-    for(const entry of entries){
-      if(entry.geo || !entry.ip || entry.ip === "unknown") continue;
-      if(!targets.includes(entry.ip)) targets.push(entry.ip);
-    }
-    if(targets.length === 0) return;
-    const resolved = new Map();
-    const missing = [];
-    for(const ip of targets){
-      const cached = await this.state.storage.get(`g:${ip}`);
-      if(cached) resolved.set(ip, cached);
-      else missing.push(ip);
-    }
-    const batch = missing.slice(0, 20);
-    const results = await Promise.all(batch.map(ip => this.lookupGeo(ip)));
-    for(let i = 0; i < batch.length; i++){
-      if(results[i]){
-        resolved.set(batch[i], results[i]);
-        await this.state.storage.put(`g:${batch[i]}`, results[i]);
-      }
-    }
-    for(const entry of entries){
-      if(!entry.geo && resolved.has(entry.ip)) entry.geo = resolved.get(entry.ip);
-    }
-  }
-
   async migrate(){
     if(this.migrated) return;
     this.migrated = true;
@@ -2027,8 +1966,7 @@ export class PlayLog {
       const opponent = String(body.opponent || "").trim().slice(0, 6);
       const ip = String(body.ip || "unknown").slice(0, 64);
       const userAgent = String(body.userAgent || "unknown").slice(0, 300);
-      const geo = sanitizeGeo(body.geo);
-      await this.state.storage.put(this.entryKey(), { name, mode, level, matchType, opponent, ip, geo, userAgent, ts: Date.now() });
+      await this.state.storage.put(this.entryKey(), { name, mode, level, matchType, opponent, ip, userAgent, ts: Date.now() });
       this.sinceLastPrune += 1;
       if(this.sinceLastPrune >= PLAY_LOG_PRUNE_EVERY){
         this.sinceLastPrune = 0;
@@ -2040,9 +1978,7 @@ export class PlayLog {
     if(body.action === "list"){
       await this.migrate();
       const map = await this.state.storage.list({ prefix: "e:", reverse: true, limit: PLAY_LOG_MAX });
-      const entries = Array.from(map.values());
-      await this.fillMissingGeo(entries);
-      return new Response(JSON.stringify({ entries }), { headers: corsHeaders() });
+      return new Response(JSON.stringify({ entries: Array.from(map.values()) }), { headers: corsHeaders() });
     }
 
     if(body.action === "clear"){
@@ -2053,26 +1989,6 @@ export class PlayLog {
 
     return new Response(JSON.stringify({ error: "unknown action" }), { status: 400, headers: corsHeaders() });
   }
-}
-
-function getRequestGeo(request){
-  const cf = request.cf || {};
-  return {
-    country: String(cf.country || "").slice(0, 8),
-    region: String(cf.region || "").slice(0, 64),
-    city: String(cf.city || "").slice(0, 64),
-    source: "Cloudflare"
-  };
-}
-
-function sanitizeGeo(geo){
-  const g = geo && typeof geo === "object" ? geo : {};
-  return {
-    country: String(g.country || "").slice(0, 8),
-    region: String(g.region || "").slice(0, 64),
-    city: String(g.city || "").slice(0, 64),
-    source: String(g.source || "").slice(0, 32)
-  };
 }
 
 async function handlePlayLog(request, env){
@@ -2092,7 +2008,7 @@ async function handlePlayLog(request, env){
   const res = await stub.fetch(new Request("https://internal/playlog", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "record", name: body.name, mode: body.mode, level: body.level, matchType: body.matchType, opponent: body.opponent, ip, geo: getRequestGeo(request), userAgent })
+    body: JSON.stringify({ action: "record", name: body.name, mode: body.mode, level: body.level, matchType: body.matchType, opponent: body.opponent, ip, userAgent })
   }));
   return new Response(await res.text(), { headers: corsHeaders() });
 }
@@ -2151,7 +2067,6 @@ export class Presence {
       kind: "client",
       id: Math.floor(Math.random() * 1000000000),
       ip: String(request.headers.get("CF-Connecting-IP") || "unknown").slice(0, 64),
-      geo: getRequestGeo(request),
       userAgent: String(request.headers.get("User-Agent") || "unknown").slice(0, 300),
       connectedAt: now,
       activity: "idle",
@@ -2219,7 +2134,6 @@ export class Presence {
         level: entry.level,
         page: entry.page,
         ip: entry.ip,
-        geo: entry.geo || null,
         userAgent: entry.userAgent,
         connectedMs: now - entry.connectedAt
       });
