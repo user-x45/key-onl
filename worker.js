@@ -738,6 +738,9 @@ function sanitizeRankingName(raw){
   return trimmed.length === 0 ? "GUEST" : trimmed;
 }
 
+const EVENT_RESULT_MONTH = "2026-10";
+const EVENT_RESULT_COMBOS = ["hiragana:beginner", "sentence:beginner"];
+
 function getCurrentMonthJST(){
   const now = new Date();
   const jst = new Date(now.getTime() + 9 * 60 * 60 * 1000);
@@ -991,16 +994,13 @@ export class Ranking {
     }
 
     const eventData = await getEventSettings(this.env);
-    let eventEnabled = Boolean(eventData.enabled);
-    let eventMonth = String(eventData.month || "");
+    const eventEnabled = Boolean(eventData.enabled);
+    const eventMonth = String(eventData.month || "");
     const eventCombos = Array.isArray(eventData.combos) ? eventData.combos : [];
 
     let activeEventMonth = eventEnabled && eventMonth === getCurrentMonthJST() && eventCombos.includes(`${mode}:${level}`);
     if(internal && body.__forceNormal){
       activeEventMonth = false;
-    } else if(internal && body.__forceEvent){
-      activeEventMonth = true;
-      eventMonth = String(body.__eventMonth || eventMonth);
     }
 
     const key = `g:${gameId}`;
@@ -3121,16 +3121,16 @@ async function route(request, env){
 
       if(request.method === "GET"){
         if(force === "event"){
-          if(!eventActive){
-            return new Response(JSON.stringify({ error: "no_event" }), { status: 409, headers: corsHeaders() });
+          if(!EVENT_RESULT_COMBOS.includes(`${mode}:${level}`)){
+            return new Response(JSON.stringify({ error: "no_event" }), { status: 404, headers: corsHeaders() });
           }
           const res = await stub.fetch(new Request("https://internal/ranking", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ action: "getMonthRanking", month: eventMonth })
+            body: JSON.stringify({ action: "getMonthRanking", month: EVENT_RESULT_MONTH })
           }));
           const data = await res.json();
-          return new Response(JSON.stringify({ scores: data.top20 || [], eventMode: true, month: eventMonth }), { headers: corsHeaders() });
+          return new Response(JSON.stringify({ scores: data.top20 || [], eventMode: true, month: EVENT_RESULT_MONTH }), { headers: corsHeaders() });
         }
         if(force === "normal"){
           const res = await stub.fetch(request);
@@ -3163,11 +3163,7 @@ async function route(request, env){
         }
         const forwardBody = { gameId: body.gameId, name: body.name, token: body.token };
         if(force === "event"){
-          if(!eventActive){
-            return new Response(JSON.stringify({ error: "no_event" }), { status: 409, headers: corsHeaders() });
-          }
-          forwardBody.__forceEvent = true;
-          forwardBody.__eventMonth = eventMonth;
+          return new Response(JSON.stringify({ error: "no_event" }), { status: 409, headers: corsHeaders() });
         } else if(force === "normal"){
           forwardBody.__forceNormal = true;
         }
