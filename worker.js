@@ -57,6 +57,8 @@ const GAME_IV_MIN_MS = 5;
 const WORD_BOUNDS_TTL_MS = 600000;
 const wordBoundsCache = {};
 
+const LOBBY_SEARCH_MS = 60000;
+
 const MATCH_COUNTDOWN_MS = 2500;
 const MATCH_PLAY_END_MS = 106000;
 const MATCH_MIN_FINISH_MS = 98000;
@@ -214,8 +216,11 @@ export class Lobby {
           ws.close(1000, "timeout");
         }catch(e){}
       }
-    }, 15000);
+    }, LOBBY_SEARCH_MS);
     this.waiting = entry;
+    try{
+      ws.send(JSON.stringify({ type: "searching", seconds: Math.round(LOBBY_SEARCH_MS / 1000) }));
+    }catch(e){}
 
     ws.addEventListener("close", () => {
       if(this.waiting === entry){
