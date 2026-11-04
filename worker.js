@@ -57,7 +57,7 @@ const GAME_IV_MIN_MS = 5;
 const WORD_BOUNDS_TTL_MS = 600000;
 const wordBoundsCache = {};
 
-const LOBBY_SEARCH_MS = 60000;
+const LOBBY_SEARCH_MS = 70000;
 
 const MATCH_COUNTDOWN_MS = 2500;
 const MATCH_PLAY_END_MS = 106000;
