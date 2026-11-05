@@ -848,7 +848,7 @@ export class Ranking {
     return gameId;
   }
 
-mode, level, body){
+  async finishGame(mode, level, body){
     const now = Date.now();
     const gameId = String(body.gameId || "");
     if(!UUID_RE.test(gameId)) return { error: "invalid_game" };
