@@ -40,6 +40,9 @@ async function pickDeck(mode, level){
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+const GAME_MIN_ELAPSED_MS = 80000;
+const GAME_MAX_CHARS = 1500;
+const GAME_MAX_MISS = 5000;
 const GAME_TTL_MS = 1800000;
 const GAME_DONE_TTL_MS = 1800000;
 
@@ -857,10 +860,15 @@ export class Ranking {
     if(!rec || rec.exp < now) return { error: "invalid_game" };
     if(rec.result) return { result: rec.result };
 
+    if(now - rec.t < GAME_MIN_ELAPSED_MS) return { error: "too_early" };
+
     const words = body.words;
     const chars = body.chars;
     const miss = body.miss;
-    if(!Number.isInteger(words) || !Number.isInteger(chars) || !Number.isInteger(miss) || words < 0 || chars < 0 || miss < 0){
+    if(!Number.isInteger(words) || !Number.isInteger(chars) || !Number.isInteger(miss)){
+      return { error: "invalid_stats" };
+    }
+    if(words < 0 || chars < 0 || miss < 0 || words > chars || chars > GAME_MAX_CHARS || miss > GAME_MAX_MISS){
       return { error: "invalid_stats" };
     }
 
