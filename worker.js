@@ -39,58 +39,39 @@ async function pickDeck(mode, level){
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const rateBuckets = new Map();
 
-const GAME_MIN_ELAPSED_MS = 80000;
 const GAME_TTL_MS = 1800000;
 const GAME_DONE_TTL_MS = 1800000;
-const GAME_MAX_CHARS = 2000;
-const GAME_SUSPICIOUS_CHARS = 1100;
-const GAME_MAX_PLAY_MS = 120000;
-const GAME_WORD_LENGTH_MARGIN = 1.5;
-const GAME_MAX_MISS = 50000;
-const GAME_START_PER_MIN = 600;
-const GAME_MAX_FAILS = 3;
-const GAME_IV_MIN_CV = 0.03;
-const GAME_IV_MIN_SAMPLES = 50;
-const GAME_IV_MIN_MS = 5;
-const WORD_BOUNDS_TTL_MS = 600000;
-const wordBoundsCache = {};
 
 const LOBBY_SEARCH_MS = 70000;
 
-const MATCH_COUNTDOWN_MS = 2500;
-const MATCH_PLAY_END_MS = 106000;
-const MATCH_MIN_FINISH_MS = 98000;
-const MATCH_MAX_CHARS_PER_SEC = 20;
-const MATCH_CHAR_BURST = 30;
-const MATCH_MAX_MISS = 50000;
 const MATCH_MAX_MESSAGE_LENGTH = 256;
 
 function isValidModeLevel(mode, level){
   return RANKING_MODES.includes(mode) && RANKING_LEVELS.includes(level);
 }
 
-function getClientIp(request){
-  return request.headers.get("CF-Connecting-IP") || "unknown";
+async function verifyTurnstile(request, env){
+  if(!env.TURNSTILE_SECRET_KEY) return false;
+  const token = request.headers.get("X-Turnstile-Token");
+  if(!token || token.length > 2048) return false;
+  const form = new FormData();
+  form.append("secret", env.TURNSTILE_SECRET_KEY);
+  form.append("response", token);
+  const ip = request.headers.get("CF-Connecting-IP");
+  if(ip) form.append("remoteip", ip);
+  try{
+    const res = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", { method: "POST", body: form });
+    if(!res.ok) return false;
+    const data = await res.json();
+    return data.success === true;
+  }catch(e){
+    return false;
+  }
 }
 
-function rateLimited(key, max, windowMs){
-  const now = Date.now();
-  if(rateBuckets.size > 5000){
-    for(const [k, v] of rateBuckets){
-      if(v.length === 0 || now - v[v.length - 1] > 120000) rateBuckets.delete(k);
-    }
-    if(rateBuckets.size > 5000) rateBuckets.clear();
-  }
-  const list = (rateBuckets.get(key) || []).filter(t => now - t < windowMs);
-  if(list.length >= max){
-    rateBuckets.set(key, list);
-    return true;
-  }
-  list.push(now);
-  rateBuckets.set(key, list);
-  return false;
+function turnstileFailed(){
+  return new Response(JSON.stringify({ error: "turnstile_failed" }), { status: 403, headers: corsHeaders() });
 }
 
 const EVENT_CACHE_TTL_MS = 15000;
@@ -108,44 +89,6 @@ async function getEventSettings(env){
   const data = await res.json();
   eventCache = { data, at: Date.now() };
   return data;
-}
-
-function tooManyRequests(){
-  return new Response(JSON.stringify({ error: "rate_limited" }), { status: 429, headers: corsHeaders() });
-}
-
-async function getWordBounds(mode, level){
-  const key = `${mode}-${level}`;
-  const cached = wordBoundsCache[key];
-  if(cached && Date.now() - cached.at < WORD_BOUNDS_TTL_MS) return cached.bounds;
-  try{
-    const list = await fetchRawWordList(key);
-    if(!Array.isArray(list) || list.length === 0) return null;
-    let min = Infinity;
-    let max = 0;
-    for(const word of list){
-      if(typeof word !== "string") return null;
-      if(word.length < min) min = word.length;
-      if(word.length > max) max = word.length;
-    }
-    if(!Number.isFinite(min) || max === 0) return null;
-    const bounds = { min, max };
-    wordBoundsCache[key] = { bounds, at: Date.now() };
-    return bounds;
-  }catch(e){
-    return cached ? cached.bounds : null;
-  }
-}
-
-function isHumanTiming(iv, words){
-  if(!iv || typeof iv !== "object") return false;
-  const { n, mean, std, min } = iv;
-  if(!Number.isInteger(n) || Math.abs(n - words) > 2) return false;
-  if(![mean, std, min].every(v => typeof v === "number" && Number.isFinite(v))) return false;
-  if(mean <= 0 || std < 0 || min < GAME_IV_MIN_MS) return false;
-  if(mean * n > GAME_MAX_PLAY_MS) return false;
-  if(n >= GAME_IV_MIN_SAMPLES && std / mean < GAME_IV_MIN_CV) return false;
-  return true;
 }
 
 async function fetchVerifiedGame(env, mode, level, gameId){
@@ -487,8 +430,8 @@ export class Match {
     this.level = "beginner";
     this.wordDeck = null;
     this.scores = {
-      p1: { score: 0, miss: 0, chars: 0, finished: false },
-      p2: { score: 0, miss: 0, chars: 0, finished: false }
+      p1: { score: 0, miss: 0, finished: false },
+      p2: { score: 0, miss: 0, finished: false }
     };
     this.startedAt = 0;
     this.ended = false;
@@ -553,17 +496,10 @@ export class Match {
 
       const state = this.scores[role];
       if(state.finished) return;
-      const elapsed = Date.now() - this.startedAt;
 
       if(msg.type === "progress"){
-        if(elapsed > MATCH_PLAY_END_MS) return;
         if(msg.score !== state.score + 1) return;
-        const word = this.wordDeck[state.score % this.wordDeck.length];
-        const nextChars = state.chars + (typeof word === "string" ? word.length : 1);
-        const playSec = Math.max(0, elapsed - MATCH_COUNTDOWN_MS) / 1000;
-        if(nextChars > MATCH_MAX_CHARS_PER_SEC * playSec + MATCH_CHAR_BURST) return;
         state.score += 1;
-        state.chars = nextChars;
         const other = role === "p1" ? "p2" : "p1";
         if(this.players[other]){
           try{
@@ -571,9 +507,8 @@ export class Match {
           }catch(e){}
         }
       } else if(msg.type === "finished"){
-        if(elapsed < MATCH_MIN_FINISH_MS) return;
         const miss = msg.miss;
-        state.miss = Number.isInteger(miss) && miss >= 0 && miss <= MATCH_MAX_MISS ? miss : 0;
+        state.miss = Number.isInteger(miss) && miss >= 0 ? miss : 0;
         state.finished = true;
         this.maybeEnd(false);
       }
@@ -823,7 +758,7 @@ function corsHeaders(){
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, X-Turnstile-Token",
     "Content-Type": "application/json; charset=utf-8"
   };
 }
@@ -834,7 +769,6 @@ export class Ranking {
     this.state = state;
     this.env = env;
     this.scores = null;
-    this.startLog = new Map();
     this.lastCleanup = 0;
     this.prunedMarker = "";
   }
@@ -906,70 +840,28 @@ export class Ranking {
     }
   }
 
-  async startGame(ip){
+  async startGame(){
     const now = Date.now();
-    if(this.startLog.size > 2000){
-      for(const [k, v] of this.startLog){
-        if(v.length === 0 || now - v[v.length - 1] > 60000) this.startLog.delete(k);
-      }
-    }
-    const recent = (this.startLog.get(ip) || []).filter(t => now - t < 60000);
-    if(recent.length >= GAME_START_PER_MIN){
-      this.startLog.set(ip, recent);
-      return null;
-    }
-    recent.push(now);
-    this.startLog.set(ip, recent);
     await this.cleanupGames(now);
     const gameId = crypto.randomUUID();
     await this.state.storage.put(`g:${gameId}`, { t: now, exp: now + GAME_TTL_MS });
     return gameId;
   }
 
-  async rejectGame(key, rec, error, detail){
-    console.warn("game rejected", error, JSON.stringify(detail));
-    rec.fails = (rec.fails || 0) + 1;
-    if(rec.fails >= GAME_MAX_FAILS){
-      await this.state.storage.delete(key);
-    } else {
-      await this.state.storage.put(key, rec);
-    }
-    return { error };
-  }
-
-  async finishGame(mode, level, body){
+mode, level, body){
     const now = Date.now();
     const gameId = String(body.gameId || "");
     if(!UUID_RE.test(gameId)) return { error: "invalid_game" };
-    const bounds = await getWordBounds(mode, level);
     const key = `g:${gameId}`;
     const rec = await this.state.storage.get(key);
     if(!rec || rec.exp < now) return { error: "invalid_game" };
     if(rec.result) return { result: rec.result };
 
-    const elapsed = now - rec.t;
-    if(elapsed < GAME_MIN_ELAPSED_MS) return { error: "too_early" };
-
     const words = body.words;
     const chars = body.chars;
     const miss = body.miss;
-    const detail = { gameId, mode, level, words, chars, miss, iv: body.iv, elapsed };
-    if(!Number.isInteger(words) || !Number.isInteger(chars) || !Number.isInteger(miss)){
-      return this.rejectGame(key, rec, "invalid_stats", detail);
-    }
-    if(words < 0 || chars < 0 || miss < 0 || words > chars || chars > GAME_MAX_CHARS || miss > GAME_MAX_MISS){
-      return this.rejectGame(key, rec, "invalid_stats", detail);
-    }
-    if(words > 0){
-      if(bounds && chars > words * bounds.max * GAME_WORD_LENGTH_MARGIN){
-        return this.rejectGame(key, rec, "invalid_stats", detail);
-      }
-      if(!isHumanTiming(body.iv, words)){
-        return this.rejectGame(key, rec, "invalid_timing", detail);
-      }
-    }
-    if(chars > GAME_SUSPICIOUS_CHARS){
-      console.warn("game accepted but suspicious", JSON.stringify(detail));
+    if(!Number.isInteger(words) || !Number.isInteger(chars) || !Number.isInteger(miss) || words < 0 || chars < 0 || miss < 0){
+      return { error: "invalid_stats" };
     }
 
     const speed = Math.round((chars / 100) * 60);
@@ -1198,7 +1090,7 @@ export class Ranking {
         }
 
         if(body.action === "gameStart"){
-          const gameId = await this.startGame(String(body.ip || "unknown").slice(0, 64));
+          const gameId = await this.startGame();
           if(!gameId){
             return this.jsonResponse({ error: "rate_limited" }, 429);
           }
@@ -3055,17 +2947,6 @@ const RANKING_EDGE_TTL_SECONDS = 10;
 
 async function route(request, env){
     const url = new URL(request.url);
-    const ip = getClientIp(request);
-
-    if(request.method !== "OPTIONS"){
-      const path = url.pathname;
-      if(path === "/auth" && rateLimited(`auth:${ip}`, 1000, 60000)) return tooManyRequests();
-      if(path === "/playlog" && rateLimited(`log:${ip}`, 1000, 60000)) return tooManyRequests();
-      if(path === "/presence" && rateLimited(`presence:${ip}`, 600, 60000)) return tooManyRequests();
-      if(path === "/ranking" && request.method === "POST" && rateLimited(`rank:${ip}`, 1000, 60000)) return tooManyRequests();
-      if(path.startsWith("/game/") && rateLimited(`game:${ip}`, 2000, 60000)) return tooManyRequests();
-      if((path === "/lobby" || path.startsWith("/friend/") || path.startsWith("/match/")) && rateLimited(`ws:${ip}`, 1000, 60000)) return tooManyRequests();
-    }
 
     if(url.pathname === "/admin"){
       return handleAdmin(request, env);
@@ -3194,9 +3075,12 @@ async function route(request, env){
       if(!isValidModeLevel(mode, level)){
         return new Response(JSON.stringify({ error: "invalid_mode" }), { status: 400, headers: corsHeaders() });
       }
+      if(!(await verifyTurnstile(request, env))){
+        return turnstileFailed();
+      }
       let payload;
       if(url.pathname === "/game/start"){
-        payload = { action: "gameStart", ip };
+        payload = { action: "gameStart" };
       } else {
         let body;
         try{
@@ -3207,7 +3091,7 @@ async function route(request, env){
         if(!body || typeof body !== "object" || Array.isArray(body)){
           return new Response(JSON.stringify({ error: "invalid body" }), { status: 400, headers: corsHeaders() });
         }
-        payload = { action: "gameFinish", gameId: body.gameId, words: body.words, chars: body.chars, miss: body.miss, iv: body.iv };
+        payload = { action: "gameFinish", gameId: body.gameId, words: body.words, chars: body.chars, miss: body.miss };
       }
       const gameStub = env.RANKING.get(env.RANKING.idFromName(`${mode}:${level}`));
       const gameRes = await gameStub.fetch(new Request(`https://internal/ranking?mode=${mode}&level=${level}`, {
