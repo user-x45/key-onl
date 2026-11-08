@@ -40,41 +40,12 @@ async function pickDeck(mode, level){
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-const GAME_MIN_ELAPSED_MS = 80000;
-const GAME_MAX_CHARS = 1500;
-const GAME_MAX_MISS = 5000;
-const GAME_TTL_MS = 1800000;
-const GAME_DONE_TTL_MS = 1800000;
-
 const LOBBY_SEARCH_MS = 70000;
 
 const MATCH_MAX_MESSAGE_LENGTH = 256;
 
 function isValidModeLevel(mode, level){
   return RANKING_MODES.includes(mode) && RANKING_LEVELS.includes(level);
-}
-
-async function verifyTurnstile(request, env){
-  if(!env.TURNSTILE_SECRET_KEY) return false;
-  const token = request.headers.get("X-Turnstile-Token");
-  if(!token || token.length > 2048) return false;
-  const form = new FormData();
-  form.append("secret", env.TURNSTILE_SECRET_KEY);
-  form.append("response", token);
-  const ip = request.headers.get("CF-Connecting-IP");
-  if(ip) form.append("remoteip", ip);
-  try{
-    const res = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", { method: "POST", body: form });
-    if(!res.ok) return false;
-    const data = await res.json();
-    return data.success === true;
-  }catch(e){
-    return false;
-  }
-}
-
-function turnstileFailed(){
-  return new Response(JSON.stringify({ error: "turnstile_failed" }), { status: 403, headers: corsHeaders() });
 }
 
 const EVENT_CACHE_TTL_MS = 15000;
@@ -92,25 +63,6 @@ async function getEventSettings(env){
   const data = await res.json();
   eventCache = { data, at: Date.now() };
   return data;
-}
-
-async function fetchVerifiedGame(env, mode, level, gameId){
-  if(!isValidModeLevel(mode, level)) return null;
-  if(typeof gameId !== "string" || !UUID_RE.test(gameId)) return null;
-  if(!env.RANKING) return null;
-  const stub = env.RANKING.get(env.RANKING.idFromName(`${mode}:${level}`));
-  try{
-    const res = await stub.fetch(new Request(`https://internal/ranking?mode=${mode}&level=${level}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "getVerifiedGame", gameId })
-    }));
-    if(!res.ok) return null;
-    const data = await res.json();
-    return data.game || null;
-  }catch(e){
-    return null;
-  }
 }
 
 export class Lobby {
@@ -501,8 +453,8 @@ export class Match {
       if(state.finished) return;
 
       if(msg.type === "progress"){
-        if(msg.score !== state.score + 1) return;
-        state.score += 1;
+        if(!Number.isInteger(msg.score) || msg.score < 0) return;
+        state.score = msg.score;
         const other = role === "p1" ? "p2" : "p1";
         if(this.players[other]){
           try{
@@ -761,7 +713,7 @@ function corsHeaders(){
   return {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Turnstile-Token",
+    "Access-Control-Allow-Headers": "Content-Type",
     "Content-Type": "application/json; charset=utf-8"
   };
 }
@@ -772,7 +724,6 @@ export class Ranking {
     this.state = state;
     this.env = env;
     this.scores = null;
-    this.lastCleanup = 0;
     this.prunedMarker = "";
   }
 
@@ -830,72 +781,10 @@ export class Ranking {
     return new Response(JSON.stringify(data), { status: status || 200, headers: corsHeaders() });
   }
 
-  async cleanupGames(now){
-    if(now - this.lastCleanup < 300000) return;
-    this.lastCleanup = now;
-    const games = await this.state.storage.list({ prefix: "g:", limit: 1000 });
-    const expired = [];
-    for(const [key, rec] of games){
-      if(!rec || typeof rec.exp !== "number" || rec.exp < now) expired.push(key);
-    }
-    for(let i = 0; i < expired.length; i += 128){
-      await this.state.storage.delete(expired.slice(i, i + 128));
-    }
-  }
-
-  async startGame(){
-    const now = Date.now();
-    await this.cleanupGames(now);
-    const gameId = crypto.randomUUID();
-    await this.state.storage.put(`g:${gameId}`, { t: now, exp: now + GAME_TTL_MS });
-    return gameId;
-  }
-
-  async finishGame(mode, level, body){
-    const now = Date.now();
-    const gameId = String(body.gameId || "");
-    if(!UUID_RE.test(gameId)) return { error: "invalid_game" };
-    const key = `g:${gameId}`;
-    const rec = await this.state.storage.get(key);
-    if(!rec || rec.exp < now) return { error: "invalid_game" };
-    if(rec.result) return { result: rec.result };
-
-    if(now - rec.t < GAME_MIN_ELAPSED_MS) return { error: "too_early" };
-
-    const words = body.words;
-    const chars = body.chars;
-    const miss = body.miss;
-    if(!Number.isInteger(words) || !Number.isInteger(chars) || !Number.isInteger(miss)){
-      return { error: "invalid_stats" };
-    }
-    if(words < 0 || chars < 0 || miss < 0 || words > chars || chars > GAME_MAX_CHARS || miss > GAME_MAX_MISS){
-      return { error: "invalid_stats" };
-    }
-
-    const speed = Math.round((chars / 100) * 60);
-    const baseScore = words * 100 + speed * 2;
-    const missPenalty = Math.min(miss * 30, baseScore * 0.5);
-    const score = Math.max(0, Math.round(baseScore - missPenalty));
-    const attempts = words + miss;
-    const accuracy = attempts === 0 ? 0 : Math.round((words / attempts) * 100);
-    rec.result = { score, accuracy, speed, miss, words, chars };
-    rec.exp = now + GAME_DONE_TTL_MS;
-    await this.state.storage.put(key, rec);
-    return { result: rec.result };
-  }
-
-  async getVerifiedGame(rawGameId){
-    const gameId = String(rawGameId || "");
-    if(!UUID_RE.test(gameId)) return null;
-    const rec = await this.state.storage.get(`g:${gameId}`);
-    if(!rec || !rec.result || rec.exp < Date.now()) return null;
-    return rec.result;
-  }
-
   async submitScore(mode, level, body, internal){
-    const gameId = String(body.gameId || "");
-    if(!UUID_RE.test(gameId)){
-      return this.jsonResponse({ error: "game_required" }, 400);
+    const score = Math.round(Number(body.score));
+    if(!Number.isFinite(score) || score <= 0){
+      return this.jsonResponse({ error: "invalid_score" }, 400);
     }
 
     const eventData = await getEventSettings(this.env);
@@ -908,29 +797,12 @@ export class Ranking {
       activeEventMonth = false;
     }
 
-    const key = `g:${gameId}`;
-    const rec = await this.state.storage.get(key);
-    if(!rec || !rec.result || rec.exp < Date.now()){
-      return this.jsonResponse({ error: "invalid_game" }, 400);
-    }
-    const score = rec.result.score;
-    if(score <= 0){
-      return this.jsonResponse({ error: "invalid_game" }, 400);
-    }
-
     if(activeEventMonth){
       const session = await resolveUserSession(this.env, body.token);
       if(!session){
         return this.jsonResponse({ error: "unauthorized" }, 401);
       }
       const monthKey = `monthScores:${eventMonth}`;
-      if(rec.usedEvent){
-        const current = (await this.state.storage.get(monthKey)) || [];
-        return this.jsonResponse({ rank: rec.eventRank || null, top20: stripSubs(current), eventMode: true, month: eventMonth, alreadySubmitted: true });
-      }
-      rec.usedEvent = true;
-      await this.state.storage.put(key, rec);
-
       const stored = (await this.state.storage.get(monthKey)) || [];
       const currentIndex = stored.findIndex(s => s.sub === session.sub);
       let monthScores = stored;
@@ -946,26 +818,8 @@ export class Ranking {
           await this.state.storage.put(monthKey, monthScores);
         }
       }
-      rec.eventRank = monthRank;
-      await this.state.storage.put(key, rec);
       return this.jsonResponse({ rank: monthRank, top20: stripSubs(monthScores), eventMode: true, month: eventMonth });
     }
-
-    if(rec.usedNormal){
-      return this.jsonResponse({
-        rank: rec.normalRank || null,
-        top20: this.scores,
-        periods: {
-          total: { rank: rec.normalRank || null, top20: this.scores },
-          week: { rank: rec.weekRank || null, top20: await this.getPeriodScores("week") },
-          month: { rank: rec.monthRank || null, top20: await this.getPeriodScores("month") },
-          ...(isTodayRankingActive() ? { today: { rank: rec.todayRank || null, top20: await this.getPeriodScores("today") } } : {})
-        },
-        alreadySubmitted: true
-      });
-    }
-    rec.usedNormal = true;
-    await this.state.storage.put(key, rec);
 
     let name = sanitizeRankingName(body.name);
     const nameCheck = await checkNameAllowed(this.env, name);
@@ -982,12 +836,6 @@ export class Ranking {
     const week = await this.addPeriodScore("week", score, name);
     const month = await this.addPeriodScore("month", score, name);
     const today = isTodayRankingActive() ? await this.addPeriodScore("today", score, name) : null;
-
-    rec.normalRank = rank;
-    rec.weekRank = week.rank;
-    rec.monthRank = month.rank;
-    if(today) rec.todayRank = today.rank;
-    await this.state.storage.put(key, rec);
 
     return this.jsonResponse({
       rank,
@@ -1095,27 +943,6 @@ export class Ranking {
             await this.state.storage.put(key, monthScores);
           }
           return new Response(JSON.stringify({ top20: stripSubs(monthScores) }), { headers: corsHeaders() });
-        }
-
-        if(body.action === "gameStart"){
-          const gameId = await this.startGame();
-          if(!gameId){
-            return this.jsonResponse({ error: "rate_limited" }, 429);
-          }
-          return this.jsonResponse({ gameId });
-        }
-
-        if(body.action === "gameFinish"){
-          const out = await this.finishGame(mode, level, body);
-          if(out.error){
-            return this.jsonResponse({ error: out.error }, 400);
-          }
-          return this.jsonResponse({ ok: true, ...out.result });
-        }
-
-        if(body.action === "getVerifiedGame"){
-          const game = await this.getVerifiedGame(body.gameId);
-          return this.jsonResponse({ game });
         }
 
         return this.jsonResponse({ error: "unknown action" }, 400);
@@ -1319,12 +1146,14 @@ export class UserAuth {
       if(!user){
         return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
       }
-      const { mode, level, gameId } = body;
-      const verified = await fetchVerifiedGame(this.env, mode, level, gameId);
-      if(!verified){
-        return new Response(JSON.stringify({ error: "invalid_game" }), { status: 400, headers: corsHeaders() });
+      const { mode, level } = body;
+      if(!isValidModeLevel(mode, level)){
+        return new Response(JSON.stringify({ error: "invalid_mode" }), { status: 400, headers: corsHeaders() });
       }
-      const score = verified.score;
+      const score = Math.round(Number(body.score));
+      if(!Number.isFinite(score) || score <= 0){
+        return new Response(JSON.stringify({ error: "invalid_score" }), { status: 400, headers: corsHeaders() });
+      }
       const key = `highScore_${mode}_${level}`;
       if(!user.highScores) user.highScores = {};
       const current = user.highScores[key] || 0;
@@ -1394,23 +1223,18 @@ export class UserAuth {
       if(!user){
         return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: corsHeaders() });
       }
-      const verified = await fetchVerifiedGame(this.env, body.mode, body.level, body.gameId);
-      if(!verified){
-        return new Response(JSON.stringify({ error: "invalid_game" }), { status: 400, headers: corsHeaders() });
+      if(!isValidModeLevel(body.mode, body.level)){
+        return new Response(JSON.stringify({ error: "invalid_mode" }), { status: 400, headers: corsHeaders() });
       }
       if(!user.playRecords) user.playRecords = [];
-      if(user.playRecords.some(r => r.gameId === body.gameId)){
-        return new Response(JSON.stringify({ ok: true, playRecords: user.playRecords }), { headers: corsHeaders() });
-      }
       const record = {
-        gameId: body.gameId,
         mode: body.mode,
         level: body.level,
         playedAt: Date.now(),
-        accuracy: verified.accuracy,
-        speed: verified.speed,
-        miss: verified.miss,
-        score: verified.score
+        accuracy: Math.round(Number(body.accuracy)) || 0,
+        speed: Math.round(Number(body.speed)) || 0,
+        miss: Math.round(Number(body.miss)) || 0,
+        score: Math.round(Number(body.score)) || 0
       };
       user.playRecords.unshift(record);
       user.playRecords = user.playRecords.slice(0, PLAY_RECORD_MAX);
@@ -1743,7 +1567,7 @@ async function handleAuth(request, env){
     const res = await authStub.fetch(new Request("https://internal/auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "setHighScore", token: body.token, mode: body.mode, level: body.level, gameId: body.gameId })
+      body: JSON.stringify({ action: "setHighScore", token: body.token, mode: body.mode, level: body.level, score: body.score })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
@@ -1781,7 +1605,7 @@ async function handleAuth(request, env){
     const res = await authStub.fetch(new Request("https://internal/auth", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "addPlayRecord", token: body.token, mode: body.mode, level: body.level, gameId: body.gameId })
+      body: JSON.stringify({ action: "addPlayRecord", token: body.token, mode: body.mode, level: body.level, accuracy: body.accuracy, speed: body.speed, miss: body.miss, score: body.score })
     }));
     return new Response(await res.text(), { headers: corsHeaders() });
   }
@@ -3055,7 +2879,7 @@ async function route(request, env){
         if(!body || typeof body !== "object" || Array.isArray(body) || body.action !== undefined){
           return new Response(JSON.stringify({ error: "forbidden" }), { status: 403, headers: corsHeaders() });
         }
-        const forwardBody = { gameId: body.gameId, name: body.name, token: body.token };
+        const forwardBody = { score: body.score, name: body.name, token: body.token };
         if(force === "event"){
           return new Response(JSON.stringify({ error: "no_event" }), { status: 409, headers: corsHeaders() });
         } else if(force === "normal"){
@@ -3069,45 +2893,6 @@ async function route(request, env){
       }
 
       return new Response("method not allowed", { status: 405, headers: corsHeaders() });
-    }
-
-    if(url.pathname === "/game/start" || url.pathname === "/game/finish"){
-      if(request.method === "OPTIONS"){
-        return new Response(null, { status: 204, headers: corsHeaders() });
-      }
-      if(request.method !== "POST"){
-        return new Response("method not allowed", { status: 405, headers: corsHeaders() });
-      }
-      const mode = url.searchParams.get("mode") || "";
-      const level = url.searchParams.get("level") || "";
-      if(!isValidModeLevel(mode, level)){
-        return new Response(JSON.stringify({ error: "invalid_mode" }), { status: 400, headers: corsHeaders() });
-      }
-      if(!(await verifyTurnstile(request, env))){
-        return turnstileFailed();
-      }
-      let payload;
-      if(url.pathname === "/game/start"){
-        payload = { action: "gameStart" };
-      } else {
-        let body;
-        try{
-          body = await request.json();
-        }catch(e){
-          return new Response(JSON.stringify({ error: "invalid body" }), { status: 400, headers: corsHeaders() });
-        }
-        if(!body || typeof body !== "object" || Array.isArray(body)){
-          return new Response(JSON.stringify({ error: "invalid body" }), { status: 400, headers: corsHeaders() });
-        }
-        payload = { action: "gameFinish", gameId: body.gameId, words: body.words, chars: body.chars, miss: body.miss };
-      }
-      const gameStub = env.RANKING.get(env.RANKING.idFromName(`${mode}:${level}`));
-      const gameRes = await gameStub.fetch(new Request(`https://internal/ranking?mode=${mode}&level=${level}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      }));
-      return new Response(await gameRes.text(), { status: gameRes.status, headers: corsHeaders() });
     }
 
     if(url.pathname === "/lobby"){
