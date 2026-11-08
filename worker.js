@@ -533,6 +533,40 @@ export class Match {
   }
 }
 
+const PLAY_DURATION_SECONDS = 100;
+const PLAY_MIN_ELAPSED_MS = 98000;
+const PLAY_TOKEN_TTL_MS = 15 * 60 * 1000;
+const PLAY_TOKEN_MAX_ACTIVE = 1000;
+const PLAY_TOKEN_RE = /^[0-9]{13}\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const HUMAN_MAX_CHARS_PER_MINUTE = 600;
+const HUMAN_MAX_WORDS_PER_SECOND = 3.5;
+const HUMAN_MAX_CHARS = Math.floor(HUMAN_MAX_CHARS_PER_MINUTE * PLAY_DURATION_SECONDS / 60);
+const HUMAN_MAX_WORDS = Math.floor(HUMAN_MAX_WORDS_PER_SECOND * PLAY_DURATION_SECONDS);
+const HUMAN_MAX_SCORE = HUMAN_MAX_WORDS * 100 + Math.round(HUMAN_MAX_CHARS_PER_MINUTE) * 2;
+const HUMAN_MAX_CHARS_PER_WORD = 60;
+
+function computeExpectedScore(correct, miss, chars){
+  const speed = Math.round((chars / PLAY_DURATION_SECONDS) * 60);
+  const baseScore = correct * 100 + speed * 2;
+  const missPenalty = Math.min(miss * 30, baseScore * 0.5);
+  return Math.max(0, Math.round(baseScore - missPenalty));
+}
+
+function isPlausibleStats(body, score){
+  const correct = body.correct;
+  const miss = body.miss;
+  const chars = body.chars;
+  if(![correct, miss, chars].every(v => Number.isInteger(v) && v >= 0)) return false;
+  if(correct === 0) return false;
+  if(correct > HUMAN_MAX_WORDS) return false;
+  if(chars > HUMAN_MAX_CHARS) return false;
+  if(chars < correct) return false;
+  if(chars > correct * HUMAN_MAX_CHARS_PER_WORD) return false;
+  if(miss > 2000) return false;
+  if(score > HUMAN_MAX_SCORE) return false;
+  return computeExpectedScore(correct, miss, chars) === score;
+}
+
 const RANKING_MAX = 20;
 const RANKING_MODES = ["hiragana", "katakana", "sentence"];
 const RANKING_LEVELS = ["beginner", "intermediate", "advanced"];
@@ -781,10 +815,45 @@ export class Ranking {
     return new Response(JSON.stringify(data), { status: status || 200, headers: corsHeaders() });
   }
 
+  async startPlay(){
+    const now = Date.now();
+    const expired = await this.state.storage.list({ prefix: "play:", end: `play:${String(now - PLAY_TOKEN_TTL_MS).padStart(13, "0")}` });
+    const staleKeys = Array.from(expired.keys());
+    for(let i = 0; i < staleKeys.length; i += 128){
+      await this.state.storage.delete(staleKeys.slice(i, i + 128));
+    }
+    const active = await this.state.storage.list({ prefix: "play:", limit: PLAY_TOKEN_MAX_ACTIVE });
+    if(active.size >= PLAY_TOKEN_MAX_ACTIVE){
+      return this.jsonResponse({ error: "too_many_requests" }, 429);
+    }
+    const playToken = `${String(now).padStart(13, "0")}.${crypto.randomUUID()}`;
+    await this.state.storage.put(`play:${playToken}`, { startedAt: now });
+    return this.jsonResponse({ playToken });
+  }
+
+  async consumePlayToken(playToken){
+    if(typeof playToken !== "string" || !PLAY_TOKEN_RE.test(playToken)) return null;
+    const key = `play:${playToken}`;
+    const entry = await this.state.storage.get(key);
+    if(!entry) return null;
+    await this.state.storage.delete(key);
+    const elapsed = Date.now() - entry.startedAt;
+    if(elapsed < PLAY_MIN_ELAPSED_MS || elapsed > PLAY_TOKEN_TTL_MS) return null;
+    return entry;
+  }
+
   async submitScore(mode, level, body, internal){
     const score = Math.round(Number(body.score));
     if(!Number.isFinite(score) || score <= 0){
       return this.jsonResponse({ error: "invalid_score" }, 400);
+    }
+
+    if(score > HUMAN_MAX_SCORE){
+      return this.jsonResponse({ error: "invalid_play" }, 400);
+    }
+    const playEntry = await this.consumePlayToken(body.playToken);
+    if(!playEntry || !isPlausibleStats(body, score)){
+      return this.jsonResponse({ error: "invalid_play" }, 400);
     }
 
     const eventData = await getEventSettings(this.env);
@@ -880,6 +949,10 @@ export class Ranking {
       if(body.action !== undefined){
         if(!internal){
           return this.jsonResponse({ error: "forbidden" }, 403);
+        }
+
+        if(body.action === "startPlay"){
+          return this.startPlay();
         }
 
         if((body.action === "clear" || body.action === "delete") && body.period === "today" && !isTodayRankingActive()){
@@ -1151,7 +1224,7 @@ export class UserAuth {
         return new Response(JSON.stringify({ error: "invalid_mode" }), { status: 400, headers: corsHeaders() });
       }
       const score = Math.round(Number(body.score));
-      if(!Number.isFinite(score) || score <= 0){
+      if(!Number.isFinite(score) || score <= 0 || score > HUMAN_MAX_SCORE){
         return new Response(JSON.stringify({ error: "invalid_score" }), { status: 400, headers: corsHeaders() });
       }
       const key = `highScore_${mode}_${level}`;
@@ -2818,6 +2891,26 @@ async function route(request, env){
       return handleAdminPresence(request, env);
     }
 
+    if(url.pathname === "/ranking-start"){
+      if(request.method === "OPTIONS"){
+        return new Response(null, { status: 204, headers: corsHeaders() });
+      }
+      if(request.method !== "POST"){
+        return new Response("method not allowed", { status: 405, headers: corsHeaders() });
+      }
+      const startMode = url.searchParams.get("mode") || "hiragana";
+      const startLevel = url.searchParams.get("level") || "beginner";
+      if(!isValidModeLevel(startMode, startLevel)){
+        return new Response(JSON.stringify({ error: "invalid_mode" }), { status: 400, headers: corsHeaders() });
+      }
+      const startStub = env.RANKING.get(env.RANKING.idFromName(`${startMode}:${startLevel}`));
+      return startStub.fetch(new Request("https://internal/ranking", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "startPlay" })
+      }));
+    }
+
     if(url.pathname === "/ranking"){
       const mode = url.searchParams.get("mode") || "hiragana";
       const level = url.searchParams.get("level") || "beginner";
@@ -2879,7 +2972,15 @@ async function route(request, env){
         if(!body || typeof body !== "object" || Array.isArray(body) || body.action !== undefined){
           return new Response(JSON.stringify({ error: "forbidden" }), { status: 403, headers: corsHeaders() });
         }
-        const forwardBody = { score: body.score, name: body.name, token: body.token };
+        const forwardBody = {
+          score: body.score,
+          name: body.name,
+          token: body.token,
+          playToken: body.playToken,
+          correct: body.correct,
+          miss: body.miss,
+          chars: body.chars
+        };
         if(force === "event"){
           return new Response(JSON.stringify({ error: "no_event" }), { status: 409, headers: corsHeaders() });
         } else if(force === "normal"){
